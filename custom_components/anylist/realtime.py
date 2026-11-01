@@ -14,11 +14,17 @@ own web client uses):
 - the server pushes tiny text messages (``refresh-user-recipe-data`` and
   ~12 other ``refresh-*`` events): coarse notifications only, no payload
   saying what changed — the client re-fetches after one
-- reconnect with exponential backoff (first retry immediate, then 2 s,
-  doubling, capped at 120 s); a session that lived at least 15 s resets
-  the backoff
+- reconnect with two-phase backoff: the first 10 attempts retry fast
+  (immediate, then 2 s, doubling, capped at 120 s) to recover from
+  brief blips; after that the retry slows to once every 30 minutes,
+  indefinitely, until it connects — the feed must always come back,
+  but a prolonged outage must never look like hammering. A session
+  that lived at least 15 s resets the backoff to the fast phase.
 - a 401 handshake (or a 4010 close) refreshes the tokens once, then
-  reconnects with the fresh token
+  reconnects with the fresh token; if the refresh itself fails 3
+  times in a row the login is dead, so the feed stops attempting and
+  lets the fallback poll surface the auth error (the feed comes back
+  on the next restart / config-entry reload once the login is fixed)
 - on reconnect, changes made during the gap were not delivered, so the
   client does a full sync
 
@@ -51,11 +57,20 @@ ACCOUNT_DELETED_MESSAGE = "did-delete-account"
 HEARTBEAT_INTERVAL = 5.0  # seconds between --heartbeat-- sends
 LIVENESS_TIMEOUT = 15.0  # seconds without any inbound frame = dead
 RECONNECT_INITIAL_DELAY = 2.0  # seconds before the first backoff retry
-RECONNECT_MAX_DELAY = 120.0  # seconds, backoff cap
+RECONNECT_MAX_DELAY = 120.0  # seconds, fast-phase backoff cap
 CONNECT_TIMEOUT = 10.0  # seconds per handshake attempt
 SEND_TIMEOUT = 5.0  # seconds per heartbeat write
 TOKEN_REFRESH_TIMEOUT = 15.0  # seconds for a token refresh
 CLOSE_CODE_UNAUTHORIZED = 4010  # server close code: refresh the token
+
+# Two-phase reconnect cadence (confirmed Nov 2, 2026). The fast phase
+# covers brief blips; the slow phase keeps a dead feed retrying forever
+# at a rate no telemetry could read as hammering. The retry never stops
+# — except for a dead login (see MAX_TOKEN_REFRESH_FAILURES), where
+# retrying cannot help and only looks like abuse.
+FAST_ATTEMPT_COUNT = 10  # fast-phase attempts before slowing down
+SLOW_RECONNECT_DELAY = 1800.0  # seconds between retries once slow (30 min)
+MAX_TOKEN_REFRESH_FAILURES = 3  # consecutive failed refreshes = dead login
 
 # Messages that mean "something changed, re-fetch". The coordinator
 # refresh re-downloads the whole snapshot, so every refresh-* event maps
@@ -96,6 +111,10 @@ class _Unauthorized(Exception):
     """The listener handshake was rejected with HTTP 401."""
 
 
+class _RefreshFailed(Exception):
+    """A token refresh call failed (the login may be dead)."""
+
+
 class _ConnectFailed(Exception):
     """A listener connection attempt failed for a non-auth reason."""
 
@@ -105,25 +124,36 @@ class _Closed(Exception):
 
 
 class _ReconnectBackoff:
-    """Exponential reconnect backoff, mirroring anylist_rs.
+    """Two-phase reconnect backoff.
 
-    The first retry after a session ends is immediate; each further retry
-    waits twice as long as the previous one, starting at the initial delay
-    and capped at the maximum. ``reset()`` (after a session that lived a
-    while) starts over.
+    Fast phase (brief blips): the first ``fast_attempts`` delays follow
+    the doubling sequence — immediate, then the initial delay, doubling,
+    capped at the maximum. Slow phase (real outage): every delay after
+    that is ``slow_delay``, so a prolonged outage probes the server only
+    every 30 minutes instead of hammering it every 2 minutes — while
+    still retrying forever, so the feed always comes back. ``reset()``
+    (after a session that lived a while) starts the fast phase over.
     """
 
     def __init__(
         self,
         initial_delay: float = RECONNECT_INITIAL_DELAY,
         max_delay: float = RECONNECT_MAX_DELAY,
+        fast_attempts: int = FAST_ATTEMPT_COUNT,
+        slow_delay: float = SLOW_RECONNECT_DELAY,
     ) -> None:
         self._initial_delay = max(initial_delay, 0.001)
         self._max_delay = max(max_delay, 0.001)
+        self._fast_attempts = max(fast_attempts, 1)
+        self._slow_delay = max(slow_delay, 0.001)
         self._next = 0.0
+        self._calls = 0
 
     def next_delay(self) -> float:
         """Return the delay before the next attempt and advance the backoff."""
+        self._calls += 1
+        if self._calls > self._fast_attempts:
+            return self._slow_delay
         delay = self._next
         if delay == 0.0:
             self._next = min(self._initial_delay, self._max_delay)
@@ -134,6 +164,7 @@ class _ReconnectBackoff:
     def reset(self) -> None:
         """Start over (call after a session that lived a while)."""
         self._next = 0.0
+        self._calls = 0
 
 
 class ConnectionState:
@@ -202,8 +233,13 @@ class AnyListPushListener:
 
     One background task owns the connection outright: it connects, runs a
     session (inbound frames, heartbeat tick, liveness check), then backs
-    off and reconnects until stopped. Callbacks are invoked on that task;
-    keep them short — a slow callback delays heartbeats.
+    off and reconnects until stopped — fast for the first 10 attempts,
+    then once every 30 minutes, forever, so the feed always comes back
+    without hammering a dead server. The only case where it stops
+    retrying is a dead login (3 failed token refreshes in a row); then
+    the fallback poll takes over until the next restart / reload.
+    Callbacks are invoked on that task; keep them short — a slow
+    callback delays heartbeats.
 
     ``on_sync`` fires for every sync-triggering push event and once on
     reconnect (changes during the gap were not delivered). ``on_connected``
@@ -226,6 +262,9 @@ class AnyListPushListener:
         liveness_timeout: float = LIVENESS_TIMEOUT,
         reconnect_initial_delay: float = RECONNECT_INITIAL_DELAY,
         reconnect_max_delay: float = RECONNECT_MAX_DELAY,
+        fast_attempts: int = FAST_ATTEMPT_COUNT,
+        slow_delay: float = SLOW_RECONNECT_DELAY,
+        max_refresh_failures: int = MAX_TOKEN_REFRESH_FAILURES,
         connect_timeout: float = CONNECT_TIMEOUT,
     ) -> None:
         self._hass = hass
@@ -239,12 +278,19 @@ class AnyListPushListener:
         self._liveness_timeout = liveness_timeout
         self._reconnect_initial_delay = reconnect_initial_delay
         self._reconnect_max_delay = reconnect_max_delay
+        self._fast_attempts = fast_attempts
+        self._slow_delay = slow_delay
+        self._max_refresh_failures = max_refresh_failures
         self._connect_timeout = connect_timeout
         self._state = ConnectionState.DISCONNECTED
         self._task: asyncio.Task | None = None
         self._closed = False
         self._closed_event = asyncio.Event()
         self._ws: Any | None = None
+        # Consecutive token-refresh failures. A successful refresh resets
+        # it (see _refresh_tokens); reaching the bound means the login is
+        # dead and the feed stops attempting (see _run).
+        self._refresh_failures = 0
 
     @property
     def state(self) -> str:
@@ -297,7 +343,10 @@ class AnyListPushListener:
     async def _run(self) -> None:
         """Connect, run sessions, and reconnect until stopped."""
         backoff = _ReconnectBackoff(
-            self._reconnect_initial_delay, self._reconnect_max_delay
+            self._reconnect_initial_delay,
+            self._reconnect_max_delay,
+            self._fast_attempts,
+            self._slow_delay,
         )
         needs_refresh = False
         first = True
@@ -308,9 +357,32 @@ class AnyListPushListener:
                 self._state = ConnectionState.CONNECTING
                 try:
                     ws = await self._open(needs_refresh)
+                except _RefreshFailed:
+                    # The refresh call itself failed. A few failures in a
+                    # row mean the login is dead: refreshing cannot help,
+                    # and hammering a dead login is exactly the pattern
+                    # that looks like abuse. Stop attempting the feed and
+                    # let the fallback poll surface the auth error — the
+                    # feed comes back on the next restart / reload once
+                    # the login is fixed. This is the only case where the
+                    # feed stops retrying; every other failure keeps
+                    # retrying (fast, then slow) forever.
+                    self._refresh_failures += 1
+                    if self._refresh_failures >= self._max_refresh_failures:
+                        _LOGGER.warning(
+                            "AnyList push feed token refresh failed %s times; "
+                            "stopping the feed (login is dead)",
+                            self._refresh_failures,
+                        )
+                        await _call_callback(self._on_disconnected)
+                        permanent_stop = True
+                        break
+                    if await self._sleep_or_close(backoff.next_delay()):
+                        break
+                    continue
                 except _Unauthorized:
-                    # Token refresh failed or the fresh token was still
-                    # rejected: back off and try again (refresh retried).
+                    # The token was rejected: back off and try again with
+                    # a refreshed token (the next _open refreshes first).
                     needs_refresh = True
                     if await self._sleep_or_close(backoff.next_delay()):
                         break
@@ -381,17 +453,15 @@ class AnyListPushListener:
         """Open one listener connection (one handshake attempt).
 
         Raises ``_Unauthorized`` when the handshake is rejected with 401
-        (after refreshing the tokens once, if asked), ``_ConnectFailed``
+        (after refreshing the tokens once, if asked), ``_RefreshFailed``
+        when the token refresh call itself fails, and ``_ConnectFailed``
         for anything else.
         """
         if refresh_first:
             try:
                 await self._refresh_tokens()
             except Exception as err:
-                # A failed refresh is a failed connection attempt, not a
-                # reason for the task to die: back off and retry (the
-                # fallback poll surfaces a permanently dead login).
-                raise _ConnectFailed(f"token refresh failed: {err}") from err
+                raise _RefreshFailed(f"token refresh failed: {err}") from err
         session = self._session or async_get_clientsession(self._hass)
         url = self._url or self._listener_url()
         try:
@@ -406,12 +476,18 @@ class AnyListPushListener:
         return ws
 
     async def _refresh_tokens(self) -> None:
-        """Refresh the client's tokens (synchronous client, in the executor)."""
+        """Refresh the client's tokens (synchronous client, in the executor).
+
+        A successful refresh breaks the streak of consecutive refresh
+        failures, so a login that recovers does not trip the dead-login
+        bound from old failures.
+        """
         await async_call_with_timeout(
             self._hass,
             self._client.refresh_tokens,
             timeout=TOKEN_REFRESH_TIMEOUT,
         )
+        self._refresh_failures = 0
 
     async def _send_heartbeat(self, ws: Any) -> None:
         """Send one heartbeat frame (raises if the socket is dead)."""

@@ -191,7 +191,7 @@ def test_parse_push_message_heartbeat_account_deleted_unknown() -> None:
 
 
 def test_reconnect_backoff_sequence_and_reset() -> None:
-    """Backoff starts immediate, doubles, caps, and resets."""
+    """Backoff starts immediate, doubles, caps, then slows, and resets."""
     backoff = _ReconnectBackoff(initial_delay=2.0, max_delay=120.0)
     assert backoff.next_delay() == 0.0
     assert backoff.next_delay() == 2.0
@@ -201,10 +201,30 @@ def test_reconnect_backoff_sequence_and_reset() -> None:
     assert backoff.next_delay() == 32.0
     assert backoff.next_delay() == 64.0
     assert backoff.next_delay() == 120.0  # capped
-    assert backoff.next_delay() == 120.0  # stays capped
+    assert backoff.next_delay() == 120.0  # stays capped (9th)
+    assert backoff.next_delay() == 120.0  # stays capped (10th)
+    # After the 10 fast attempts, the slow phase: every 30 minutes,
+    # indefinitely, until it connects.
+    assert backoff.next_delay() == 1800.0
+    assert backoff.next_delay() == 1800.0
+    assert backoff.next_delay() == 1800.0
     backoff.reset()
     assert backoff.next_delay() == 0.0
     assert backoff.next_delay() == 2.0
+
+
+def test_reconnect_backoff_custom_fast_attempts_and_slow_delay() -> None:
+    """Fast-attempt count and slow delay are configurable."""
+    backoff = _ReconnectBackoff(
+        initial_delay=2.0, max_delay=120.0, fast_attempts=3, slow_delay=30.0
+    )
+    assert backoff.next_delay() == 0.0
+    assert backoff.next_delay() == 2.0
+    assert backoff.next_delay() == 4.0
+    assert backoff.next_delay() == 30.0  # slow phase from the 4th delay
+    assert backoff.next_delay() == 30.0
+    backoff.reset()
+    assert backoff.next_delay() == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -359,12 +379,23 @@ async def test_close_4010_refreshes_token_and_reconnects() -> None:
         await listener.stop()
 
 
-async def test_failed_token_refresh_keeps_retrying() -> None:
-    """A failing token refresh backs off and retries instead of dying."""
+async def test_failed_token_refresh_retries_before_the_bound() -> None:
+    """One or two failed refreshes still retry; the feed is not dead yet.
+
+    The bound is 10 here (not the default 3) with slow-ish retry delays,
+    so the test can observe the listener still retrying after two
+    failures without racing the bound.
+    """
     session = _FakeSession(failures=[_Fake401()])
     client = _FakeClient()
     client.refresh_error = RuntimeError("refresh down")
-    listener, _, _ = _make_listener(session, client=client)
+    listener, _, _ = _make_listener(
+        session,
+        client=client,
+        reconnect_initial_delay=0.5,
+        reconnect_max_delay=0.5,
+        max_refresh_failures=10,
+    )
     listener.start()
     try:
         await _wait_until(lambda: client.refresh_calls >= 2, timeout=3.0)
@@ -373,6 +404,91 @@ async def test_failed_token_refresh_keeps_retrying() -> None:
             ConnectionState.RECONNECTING,
         )
         assert len(session.connects) == 1  # never got past the refresh
+    finally:
+        await listener.stop()
+
+
+async def test_failed_token_refresh_stops_after_three_failures() -> None:
+    """Three failed refreshes in a row mean a dead login: the feed stops.
+
+    Polling resumes (on_disconnected fires once) so the fallback poll
+    surfaces the auth error, and no further refresh is attempted — the
+    feed only comes back on the next restart / reload.
+    """
+    session = _FakeSession(failures=[_Fake401()])
+    client = _FakeClient()
+    client.refresh_error = RuntimeError("refresh down")
+    listener, calls, _ = _make_listener(session, client=client)
+    listener.start()
+    try:
+        await _wait_until(
+            lambda: listener.state == ConnectionState.CLOSED, timeout=3.0
+        )
+        assert client.refresh_calls == 3
+        assert len(calls["disconnected"]) == 1
+        assert len(session.connects) == 1  # never got past the refresh
+        await asyncio.sleep(0.2)
+        assert client.refresh_calls == 3  # no further attempts
+    finally:
+        await listener.stop()
+    assert listener.state == ConnectionState.CLOSED
+
+
+async def test_slow_phase_keeps_retrying_forever() -> None:
+    """After the fast phase, the feed keeps retrying slowly — never stops.
+
+    With a 3-attempt fast phase and a tiny slow delay, the listener
+    must still be making connection attempts well past the fast phase,
+    and must never reach CLOSED on its own.
+    """
+    session = _FakeSession(failures=[RuntimeError("down")] * 20)
+    listener, _, _ = _make_listener(
+        session, fast_attempts=3, slow_delay=0.05
+    )
+    listener.start()
+    try:
+        await _wait_until(lambda: len(session.connects) >= 7, timeout=3.0)
+        assert listener.state in (
+            ConnectionState.CONNECTING,
+            ConnectionState.RECONNECTING,
+        )
+        await _wait_until(lambda: len(session.connects) >= 9, timeout=3.0)
+        assert listener.state != ConnectionState.CLOSED
+    finally:
+        await listener.stop()
+
+
+async def test_reconnect_after_healthy_session_starts_fast_again() -> None:
+    """A session that lived a while resets the backoff to the fast phase.
+
+    The first three connects fail (exhausting the 3-attempt fast phase),
+    so the next retry would wait the 60 s slow delay — but the fourth
+    connect succeeds and the session lives past the liveness timeout,
+    which resets the backoff. When that session then drops, the
+    reconnect is immediate again instead of waiting 60 s.
+    """
+    session = _FakeSession(
+        failures=[RuntimeError("down")] * 3,
+    )
+    listener, _, _ = _make_listener(
+        session,
+        heartbeat_interval=0.05,
+        liveness_timeout=0.1,
+        fast_attempts=3,
+        slow_delay=60.0,
+    )
+    listener.start()
+    try:
+        await _wait_until(lambda: listener.connected, timeout=3.0)
+        # The session ends by itself on the liveness timeout (~0.15 s
+        # in, past the 0.1 s threshold), which resets the backoff; the
+        # reconnect after it must be immediate, not the 60 s slow delay.
+        await _wait_until(lambda: len(session.connects) >= 5, timeout=3.0)
+        assert listener.state in (
+            ConnectionState.CONNECTED,
+            ConnectionState.CONNECTING,
+            ConnectionState.RECONNECTING,
+        )
     finally:
         await listener.stop()
 
