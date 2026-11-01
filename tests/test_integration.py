@@ -54,6 +54,8 @@ from custom_components.anylist.const import (
 )
 from custom_components.anylist.diagnostics import async_get_config_entry_diagnostics
 from custom_components.anylist.sensor import AnyListICalendarURLSensor
+from custom_components.anylist.store import open_store
+from custom_components.anylist.sync import sync_snapshot
 from custom_components.anylist.todo import AnyListTodoEntity, async_setup_entry as async_setup_todo_entry
 
 from .conftest import (
@@ -129,8 +131,8 @@ async def test_setup_entry_creates_todo_entity_and_unloads(
     assert entry.state is ConfigEntryState.LOADED
     assert entry.runtime_data.client is client
     assert hass.states.get("todo.anylist_groceries") is not None
-    assert ("get_lists", ()) in client.calls
-    assert ("get_favourites", ()) in client.calls
+    # One download feeds lists, favourites, and the recipe cache.
+    assert ("get_user_data", ()) in client.calls
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
@@ -233,7 +235,7 @@ async def test_poll_interval_options_reload_and_refresh(hass: HomeAssistant) -> 
             blocking=True,
         )
         assert ("add_item", ("list-1", "Apples")) in client.calls
-        assert ("get_lists", ()) in client.calls
+        assert ("get_user_data", ()) in client.calls
 
         client.calls.clear()
         await hass.services.async_call(
@@ -242,7 +244,7 @@ async def test_poll_interval_options_reload_and_refresh(hass: HomeAssistant) -> 
             {ATTR_CONFIG_ENTRY_ID: entry.entry_id},
             blocking=True,
         )
-        assert ("get_lists", ()) in client.calls
+        assert ("get_user_data", ()) in client.calls
 
 
 async def test_setup_entry_raises_auth_failed(hass: HomeAssistant) -> None:
@@ -553,6 +555,13 @@ async def test_service_actions_return_responses(hass: HomeAssistant) -> None:
     entry = _mock_entry()
     entry.add_to_hass(hass)
     client, coordinator = _attach_runtime(hass, entry)
+    # The read actions serve from the store: seed it from the fake
+    # snapshot the way the coordinator does, then clear the log so the
+    # test measures only the service calls.
+    store = open_store(":memory:")
+    sync_snapshot(store, client.get_user_data())
+    client.calls.clear()
+    entry.runtime_data.store = store
 
     assert await async_setup(hass, {})
 
@@ -839,7 +848,7 @@ async def test_fetch_data_auth_failure_raises_reauth(
     from custom_components.anylist import _async_fetch_data
 
     client = SimpleNamespace(
-        get_lists=lambda: (_ for _ in ()).throw(AnyListAuthError("bad auth")),
+        get_user_data=lambda: (_ for _ in ()).throw(AnyListAuthError("bad auth")),
     )
 
     with pytest.raises(ConfigEntryAuthFailed):
@@ -854,7 +863,7 @@ async def test_fetch_data_timeout_raises_update_failed(
     from custom_components.anylist.client import AnyListTimeoutError
 
     client = SimpleNamespace(
-        get_lists=lambda: (_ for _ in ()).throw(AnyListTimeoutError("timeout")),
+        get_user_data=lambda: (_ for _ in ()).throw(AnyListTimeoutError("timeout")),
     )
 
     with pytest.raises(UpdateFailed):

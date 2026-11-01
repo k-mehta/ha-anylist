@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
 import logging
+from pathlib import Path
 from typing import Any
 
 import voluptuous as vol
@@ -34,7 +36,12 @@ from .client import (
     AnyListHTTPError,
     AnyListTimeoutError,
     Ingredient,
+    Recipe,
+    RecipeCollection,
+    ShoppingList,
     async_call_with_timeout,
+    parse_user_data,
+    select_recipe_collection,
 )
 from .const import (
     ANYLIST_DEFAULT_POLL_INTERVAL,
@@ -96,8 +103,10 @@ from .recipe_search import (
     DEFAULT_SEARCH_LIMIT,
     MAX_SEARCH_LIMIT,
     normalize_search_text,
-    search_recipes,
+    search_store,
 )
+from .store import RecipeStore
+from .sync import data_to_recipe, sync_snapshot
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -112,6 +121,9 @@ class AnyListRuntimeData:
     client: AnyListClient
     coordinator: DataUpdateCoordinator[dict[str, Any]]
     icalendar_url: str | None
+    # The recipe cache (SQLite, design §5). None in tests and before
+    # setup opens it; always set for a loaded entry.
+    store: RecipeStore | None = None
 
 
 INGREDIENT_INPUT_SCHEMA = vol.Schema(
@@ -379,22 +391,151 @@ def _serialize_collection(collection: Any) -> dict[str, Any]:
     }
 
 
-async def _async_load_recipes(
-    hass: HomeAssistant, client: Any, call: ServiceCall
-) -> list[Any]:
-    """Load recipes with an optional collection filter from the same snapshot."""
-    try:
-        return await async_call_with_timeout(
-            hass,
-            client.get_recipes,
-            call.data.get(ATTR_COLLECTION_ID),
-            call.data.get(ATTR_COLLECTION_NAME),
-            timeout=ANYLIST_REQUEST_TIMEOUT,
+def _require_store(
+    entry_data: AnyListRuntimeData, translation_key: str
+) -> RecipeStore:
+    """Return the entry's recipe store, or raise the load-failed error.
+
+    The store is None only in tests that never attached one; a loaded
+    entry always has it (setup raises ConfigEntryNotReady otherwise).
+    """
+    store = entry_data.store
+    if store is None:
+        raise _translated_error(translation_key, error="recipe cache is not open")
+    return store
+
+
+def _collections_by_id(store: RecipeStore) -> dict[str, RecipeCollection]:
+    """The store's collections as client objects, keyed by id."""
+    return {
+        collection.id: RecipeCollection(
+            id=collection.id,
+            name=collection.name,
+            recipe_ids=list(collection.recipe_ids),
         )
-    except AnyListCollectionError as err:
-        raise _translated_error(err.reason) from err
+        for collection in store.list_collections()
+    }
+
+
+def _resolve_collection(
+    store: RecipeStore,
+    collection_id: str | None,
+    collection_name: str | None,
+) -> RecipeCollection | None:
+    """Resolve a collection selector against the store (blocking).
+
+    Returns None when neither selector is given. Raises
+    ``AnyListCollectionError`` with the same reasons as the client
+    read (``collection_not_found`` / ``collection_ambiguous`` /
+    ``collection_selector_required``), so the handlers translate it
+    the same way.
+    """
+    if collection_id is None and collection_name is None:
+        return None
+    return select_recipe_collection(
+        list(_collections_by_id(store).values()),
+        collection_id,
+        collection_name,
+    )
+
+
+def _read_recipes_from_store(
+    store: RecipeStore,
+    collection_id: str | None,
+    collection_name: str | None,
+    query: str | None,
+) -> list[Recipe]:
+    """Read recipes from the store as client objects (blocking).
+
+    The collection selector is validated first, exactly as the old
+    client read did; the query is the same raw substring filter the
+    old handler applied, now a LIKE on the normalized name.
+    """
+    collection = _resolve_collection(store, collection_id, collection_name)
+    by_id = _collections_by_id(store)
+    data = store.list_recipes(
+        collection_id=collection.id if collection is not None else None,
+        name_substring=query or None,
+    )
+    return [data_to_recipe(recipe, by_id) for recipe in data]
+
+
+def _search_store(
+    store: RecipeStore,
+    query: str,
+    limit: int,
+    include_ingredients: bool,
+    collection_id: str | None,
+    collection_name: str | None,
+) -> dict[str, Any]:
+    """Search the store, scoped to a collection when given (blocking)."""
+    collection = _resolve_collection(store, collection_id, collection_name)
+    return search_store(
+        store,
+        query,
+        limit=limit,
+        include_ingredients=include_ingredients,
+        recipe_ids=(
+            frozenset(collection.recipe_ids) if collection is not None else None
+        ),
+    )
+
+
+def _resolve_recipe_from_store(
+    store: RecipeStore,
+    recipe_id: str | None,
+    recipe_name: str | None,
+) -> Recipe | None:
+    """Resolve one recipe from the store as a client object (blocking).
+
+    By ID, or by exact raw name. Returns None when there is no match.
+    """
+    if recipe_id is not None:
+        data = store.get_recipe(recipe_id)
+    else:
+        data = store.get_recipe_by_name(recipe_name or "")
+    if data is None:
+        return None
+    return data_to_recipe(data, _collections_by_id(store))
+
+
+async def _async_resolve_recipe_from_store(
+    hass: HomeAssistant,
+    store: RecipeStore,
+    *,
+    recipe_id: str | None = None,
+    recipe_name: str | None = None,
+    name_label: str = ATTR_NAME,
+) -> Recipe:
+    """Resolve a recipe by ID or name from the store (no download).
+
+    Same validation and errors as the client resolver, minus the
+    download: exactly one selector, a missing recipe raises
+    ``recipe_not_found``, a store failure raises ``recipe_load_failed``.
+    The write actions keep the client resolver: they resolve live data
+    at write time, and update's post-write re-resolve would read a
+    stale cache without the post-write refresh work (a follow-up).
+    """
+    _validate_exactly_one(
+        recipe_id,
+        recipe_name,
+        first_label=ATTR_RECIPE_ID,
+        second_label=name_label,
+    )
+    identifier = recipe_id if _value_is_set(recipe_id) else recipe_name
+    try:
+        recipe = await hass.async_add_executor_job(
+            _resolve_recipe_from_store, store, recipe_id, recipe_name
+        )
     except Exception as err:
-        raise _translated_error("recipes_load_failed", error=err) from err
+        raise _translated_error(
+            "recipe_load_failed",
+            identifier=identifier,
+            error=err,
+        ) from err
+    if recipe is None:
+        raise _translated_error("recipe_not_found", identifier=identifier)
+    return recipe
 
 
 def _build_ingredients(ingredients_data: list[dict[str, Any]]) -> list[Any]:
@@ -510,46 +651,68 @@ async def _async_resolve_recipe(
     return recipe
 
 
-async def _async_resolve_list(
-    hass: HomeAssistant,
-    client: Any,
+def _resolve_list(
+    lists: Iterable[ShoppingList],
     *,
     list_id: str | None,
     list_name: str | None,
-) -> Any:
-    """Resolve a shopping list by ID or exact name."""
+) -> ShoppingList:
+    """Resolve a shopping list by ID or exact name from coordinator data.
+
+    The coordinator already downloads the lists every poll, so
+    resolving from its data costs no extra download — the old version
+    called ``client.get_lists()`` on every service call. The lists
+    are at most one poll old: a list renamed on the phone in the last
+    minute resolves under its old name until the next poll, and the
+    following live write then fails loudly if the id is gone.
+    """
     _validate_exactly_one(
         list_id,
         list_name,
         first_label=ATTR_LIST_ID,
         second_label=ATTR_LIST_NAME,
     )
-
-    try:
-        lists = await async_call_with_timeout(
-            hass,
-            client.get_lists,
-            timeout=ANYLIST_REQUEST_TIMEOUT,
-        )
-    except Exception as err:
-        raise _translated_error("shopping_lists_load_failed", error=err) from err
-
     for shopping_list in lists:
         if _value_is_set(list_id) and shopping_list.id == list_id:
             return shopping_list
         if _value_is_set(list_name) and shopping_list.name == list_name:
             return shopping_list
-
     identifier = list_id if _value_is_set(list_id) else list_name
     raise _translated_error("shopping_list_not_found", identifier=identifier)
 
 
-async def _async_fetch_data(hass: HomeAssistant, client: Any) -> dict[str, Any]:
+def _open_recipe_store(hass: HomeAssistant, entry_id: str) -> RecipeStore:
+    """Open the recipe store for a config entry (blocking file I/O).
+
+    The database lives at ``config/anylist/<entry_id>.db`` (design §9);
+    the directory is created if missing. Call from the executor.
+    """
+    path = Path(hass.config.path("anylist", f"{entry_id}.db"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return RecipeStore(path).open()
+
+
+def _remove_recipe_store_files(db_path: Path) -> None:
+    """Delete a recipe store and its SQLite sidecar files, best effort."""
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        try:
+            db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
+        except OSError as err:
+            _LOGGER.debug(
+                "Could not delete AnyList recipe cache file %s: %s",
+                db_path.name + suffix,
+                err,
+            )
+
+
+async def _async_fetch_data(
+    hass: HomeAssistant, client: Any, store: RecipeStore | None = None
+) -> dict[str, Any]:
     """Fetch AnyList data for the coordinator."""
     _LOGGER.debug("Starting AnyList data fetch")
     try:
         return await asyncio.wait_for(
-            _async_fetch_data_stages(hass, client),
+            _async_fetch_data_stages(hass, client, store),
             timeout=ANYLIST_REFRESH_TIMEOUT,
         )
     except asyncio.TimeoutError as err:
@@ -559,43 +722,58 @@ async def _async_fetch_data(hass: HomeAssistant, client: Any) -> dict[str, Any]:
 async def _async_fetch_data_stages(
     hass: HomeAssistant,
     client: Any,
+    store: RecipeStore | None = None,
 ) -> dict[str, Any]:
-    """Fetch AnyList data with stage-level logging and errors."""
+    """Fetch AnyList data with stage-level logging and errors.
+
+    One ``get_user_data()`` download per poll feeds the lists, the
+    favourites, and the recipe-cache sync (design §6) — the snapshot
+    bytes are parsed once and shared, instead of one download per
+    section as before.
+    """
     try:
-        _LOGGER.debug("Fetching AnyList lists")
-        lists = await async_call_with_timeout(
+        _LOGGER.debug("Fetching AnyList data")
+        data = await async_call_with_timeout(
             hass,
-            client.get_lists,
+            client.get_user_data,
             timeout=ANYLIST_REQUEST_TIMEOUT,
         )
+        snapshot = parse_user_data(data)
     except AnyListTimeoutError as err:
-        raise UpdateFailed("Timed out fetching AnyList lists") from err
+        raise UpdateFailed("Timed out fetching AnyList data") from err
     except Exception as err:
         if _is_auth_error(err):
             raise ConfigEntryAuthFailed("AnyList authentication failed") from err
-        raise UpdateFailed(f"Error fetching AnyList lists: {err}") from err
+        raise UpdateFailed(f"Error fetching AnyList data: {err}") from err
 
-    _LOGGER.debug("Fetched %s AnyList list(s)", len(lists))
+    _LOGGER.debug(
+        "Fetched %s AnyList list(s), %s favourite(s), %s recipe(s)",
+        len(snapshot.lists),
+        len(snapshot.favourites),
+        len(snapshot.recipes),
+    )
 
-    try:
-        _LOGGER.debug("Fetching AnyList favourites")
-        favourites = await async_call_with_timeout(
-            hass,
-            client.get_favourites,
-            timeout=ANYLIST_REQUEST_TIMEOUT,
-        )
-    except AnyListTimeoutError as err:
-        raise UpdateFailed("Timed out fetching AnyList favourites") from err
-    except Exception as err:
-        if _is_auth_error(err):
-            raise ConfigEntryAuthFailed("AnyList authentication failed") from err
-        raise UpdateFailed(f"Error fetching AnyList favourites: {err}") from err
+    if store is not None:
+        try:
+            result = await hass.async_add_executor_job(sync_snapshot, store, data)
+            _LOGGER.debug(
+                "AnyList recipe cache sync: %d added, %d updated, "
+                "%d unchanged, %d deleted recipes",
+                result.recipes_added,
+                result.recipes_updated,
+                result.recipes_unchanged,
+                result.recipes_deleted,
+            )
+        except Exception as err:
+            # The cache is a cache: a failed sync must not take the
+            # shopping lists down with it. The last good data keeps
+            # serving until the next poll.
+            _LOGGER.warning("AnyList recipe cache sync failed: %s", err)
 
-    _LOGGER.debug("Fetched %s AnyList favourite(s)", len(favourites))
     _LOGGER.debug("AnyList data fetch complete")
     return {
-        "lists": lists,
-        "favourites": favourites,
+        "lists": snapshot.lists,
+        "favourites": snapshot.favourites,
     }
 
 
@@ -651,26 +829,26 @@ def _async_register_services(hass: HomeAssistant) -> None:
         await _async_refresh_entry(hass, entry_id)
 
     async def async_handle_get_recipes(call: ServiceCall) -> ServiceResponse:
-        """Return AnyList recipes for automations."""
+        """Return AnyList recipes for automations, from the local cache."""
         _, entry_data = _get_entry_runtime_data(
             hass,
             call.data.get(ATTR_CONFIG_ENTRY_ID),
         )
-        client = entry_data.client
+        store = _require_store(entry_data, "recipes_load_failed")
+        try:
+            recipes = await hass.async_add_executor_job(
+                _read_recipes_from_store,
+                store,
+                call.data.get(ATTR_COLLECTION_ID),
+                call.data.get(ATTR_COLLECTION_NAME),
+                call.data.get(ATTR_QUERY),
+            )
+        except AnyListCollectionError as err:
+            raise _translated_error(err.reason) from err
+        except Exception as err:
+            raise _translated_error("recipes_load_failed", error=err) from err
         include_ingredients = call.data[ATTR_INCLUDE_INGREDIENTS]
         include_steps = call.data[ATTR_INCLUDE_STEPS]
-        query = call.data.get(ATTR_QUERY)
-
-        recipes = await _async_load_recipes(hass, client, call)
-
-        if query:
-            query_lower = query.lower()
-            recipes = [
-                recipe
-                for recipe in recipes
-                if query_lower in (getattr(recipe, ATTR_NAME, "") or "").lower()
-            ]
-
         return {
             "recipes": [
                 _serialize_recipe(
@@ -683,37 +861,49 @@ def _async_register_services(hass: HomeAssistant) -> None:
         }
 
     async def async_handle_search_recipes(call: ServiceCall) -> ServiceResponse:
-        """Search locally and return candidates for a subsequent get_recipe call."""
+        """Search the local cache and return candidates for a get_recipe call."""
         query = call.data[ATTR_QUERY]
         if not normalize_search_text(query):
             raise _translated_error("empty_search_query")
         _, entry_data = _get_entry_runtime_data(
             hass, call.data.get(ATTR_CONFIG_ENTRY_ID)
         )
-        recipes = await _async_load_recipes(hass, entry_data.client, call)
-
-        return await hass.async_add_executor_job(
-            lambda: search_recipes(
-                recipes,
+        store = _require_store(entry_data, "recipes_load_failed")
+        try:
+            return await hass.async_add_executor_job(
+                _search_store,
+                store,
                 query,
-                limit=call.data[ATTR_LIMIT],
-                include_ingredients=call.data[ATTR_INCLUDE_INGREDIENTS],
+                call.data[ATTR_LIMIT],
+                call.data[ATTR_INCLUDE_INGREDIENTS],
+                call.data.get(ATTR_COLLECTION_ID),
+                call.data.get(ATTR_COLLECTION_NAME),
             )
-        )
+        except AnyListCollectionError as err:
+            raise _translated_error(err.reason) from err
+        except Exception as err:
+            raise _translated_error("recipes_load_failed", error=err) from err
 
     async def async_handle_get_recipe(call: ServiceCall) -> ServiceResponse:
-        """Return a single AnyList recipe."""
+        """Return a single AnyList recipe, from the local cache."""
+        # Request validation first: a missing selector is the caller's
+        # error, whatever state the cache is in.
+        _validate_exactly_one(
+            call.data.get(ATTR_RECIPE_ID),
+            call.data.get(ATTR_NAME),
+            first_label=ATTR_RECIPE_ID,
+            second_label=ATTR_NAME,
+        )
         _, entry_data = _get_entry_runtime_data(
             hass,
             call.data.get(ATTR_CONFIG_ENTRY_ID),
         )
-        client = entry_data.client
-        recipe = await _async_resolve_recipe(
+        store = _require_store(entry_data, "recipe_load_failed")
+        recipe = await _async_resolve_recipe_from_store(
             hass,
-            client,
+            store,
             recipe_id=call.data.get(ATTR_RECIPE_ID),
             recipe_name=call.data.get(ATTR_NAME),
-            name_label=ATTR_NAME,
         )
 
         return {
@@ -729,10 +919,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
         _, entry_data = _get_entry_runtime_data(
             hass, call.data.get(ATTR_CONFIG_ENTRY_ID)
         )
+        store = _require_store(entry_data, "collections_load_failed")
         try:
-            collections = await async_call_with_timeout(
-                hass, entry_data.client.get_collections, timeout=ANYLIST_REQUEST_TIMEOUT
-            )
+            collections = await hass.async_add_executor_job(store.list_collections)
         except Exception as err:
             raise _translated_error("collections_load_failed", error=err) from err
         return {"collections": [_serialize_collection(value) for value in collections]}
@@ -787,9 +976,8 @@ def _async_register_services(hass: HomeAssistant) -> None:
             recipe_name=call.data.get(ATTR_RECIPE_NAME),
             name_label=ATTR_RECIPE_NAME,
         )
-        shopping_list = await _async_resolve_list(
-            hass,
-            client,
+        shopping_list = _resolve_list(
+            (entry_data.coordinator.data or {}).get("lists", []),
             list_id=call.data.get(ATTR_LIST_ID),
             list_name=call.data.get(ATTR_LIST_NAME),
         )
@@ -1182,6 +1370,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         raise ConfigEntryNotReady(f"Unexpected AnyList setup failure: {err}") from err
 
+    # The recipe cache opens here so the coordinator's first refresh can
+    # populate it; a corrupt cache file is quarantined and rebuilt by
+    # the store itself (design §9). If opening fails, setup retries
+    # rather than running without a cache.
+    try:
+        store = await hass.async_add_executor_job(
+            _open_recipe_store, hass, entry.entry_id
+        )
+    except Exception as err:
+        raise ConfigEntryNotReady(f"Failed to open AnyList recipe cache: {err}") from err
+
     icalendar_url = None
     if _entry_option(entry, CONF_MEAL_PLAN_CALENDAR, False):
         try:
@@ -1206,7 +1405,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def async_update_data() -> dict[str, Any]:
         """Fetch data from AnyList."""
-        return await _async_fetch_data(hass, client)
+        return await _async_fetch_data(hass, client, store)
 
     poll_interval = get_poll_interval(entry)
     coordinator = DataUpdateCoordinator(
@@ -1224,6 +1423,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         client=client,
         coordinator=coordinator,
         icalendar_url=icalendar_url,
+        store=store,
     )
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
@@ -1297,6 +1497,15 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     platforms = get_platforms(entry)
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, platforms):
+        runtime_data = getattr(entry, "runtime_data", None)
+        if runtime_data is not None and runtime_data.store is not None:
+            runtime_data.store.close()
         entry.runtime_data = None
 
     return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete the recipe cache when the config entry is removed."""
+    db_path = Path(hass.config.path("anylist", f"{entry.entry_id}.db"))
+    await hass.async_add_executor_job(_remove_recipe_store_files, db_path)
