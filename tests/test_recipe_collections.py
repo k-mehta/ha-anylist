@@ -13,6 +13,8 @@ from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.anylist import async_setup
 from custom_components.anylist import client as wire
+from custom_components.anylist.store import StoreError, open_store
+from custom_components.anylist.sync import sync_snapshot
 
 from .test_client import _client
 from .test_integration import _attach_runtime, _mock_entry
@@ -274,13 +276,23 @@ def test_failed_write_is_not_retried_or_reported_as_confirmed():
     client.get_user_data.assert_called_once_with()
 
 
-async def _setup(hass):
-    """Register collection services with an isolated client and account."""
+async def _setup(hass, data=None):
+    """Register collection services with an isolated client and account.
+
+    The read actions serve from the store, so the setup seeds it from
+    the same snapshot the mocked client returns — the way the
+    coordinator does. The seeding download is setup, not measured
+    behavior, so the mock's call log is reset afterwards.
+    """
     entry = _mock_entry()
     entry.add_to_hass(hass)
     _attach_runtime(hass, entry)
-    client = _read_client()
+    client = _read_client(data)
     entry.runtime_data.client = client
+    store = open_store(":memory:")
+    sync_snapshot(store, client.get_user_data())
+    client.get_user_data.reset_mock()
+    entry.runtime_data.store = store
     assert await async_setup(hass, {})
     return client, entry
 
@@ -317,11 +329,15 @@ async def test_all_read_actions_expose_exact_collection_references(hass):
 @pytest.mark.parametrize("action", ["get_recipes", "search_recipes"])
 async def test_service_collection_filters_precede_query_and_limit(hass, action):
     """Filter before matching and limits, and distinguish empty and missing sets."""
-    client, _ = await _setup(hass)
+    _, entry = await _setup(hass)
     # The alphabetically first exact match is outside the selected collection.
-    client.get_user_data.return_value = _data(
-        [_collection(recipe_ids=("pasta",)), _collection("empty", "Empty", ())],
-        recipes=(("martini", "Pasta"), ("pasta", "Pasta")),
+    # The new snapshot reaches the store through a sync, as a poll would.
+    sync_snapshot(
+        entry.runtime_data.store,
+        _data(
+            [_collection(recipe_ids=("pasta",)), _collection("empty", "Empty", ())],
+            recipes=(("martini", "Pasta"), ("pasta", "Pasta")),
+        ),
     )
     data = {"collection_name": "cocktails", "query": "a"}
     if action == "search_recipes":
@@ -404,8 +420,7 @@ async def test_missing_collection_selector_rejected_before_retrieval(hass):
 async def test_collection_services_keep_accounts_separate(hass):
     """Use the selected account and reject implicit selection across accounts."""
     first, _ = await _setup(hass)
-    second, entry = await _setup(hass)
-    second.get_user_data.return_value = _data([])
+    second, entry = await _setup(hass, _data([]))
     with pytest.raises(HomeAssistantError) as error:
         await _call(hass, "get_collections")
     assert error.value.translation_key == "multiple_entries"
@@ -432,25 +447,32 @@ async def test_collection_services_keep_accounts_separate(hass):
     [
         ("get_collections", {}, "collections_load_failed"),
         ("get_recipes", {"collection_id": "cocktails"}, "recipes_load_failed"),
-        (
-            "add_recipe_to_collection",
-            {"recipe_id": "martini", "collection_id": "cocktails"},
-            "collection_update_failed",
-        ),
     ],
 )
-@pytest.mark.parametrize(
-    "failure", [wire.AnyListError("offline"), wire.AnyListTimeoutError("timeout")]
-)
-async def test_collection_service_errors_are_translated(
-    hass, action, data, key, failure
-):
-    """Translate retrieval and update failures while preserving their causes."""
-    client, _ = await _setup(hass)
-    client.get_user_data.side_effect = failure
+async def test_collection_read_errors_are_translated(hass, action, data, key):
+    """A closed recipe cache fails reads with the load-failed translation."""
+    _, entry = await _setup(hass)
+    entry.runtime_data.store.close()
     with pytest.raises(HomeAssistantError) as error:
         await _call(hass, action, data)
     assert error.value.translation_key == key
+    assert isinstance(error.value.__cause__, StoreError)
+
+
+@pytest.mark.parametrize(
+    "failure", [wire.AnyListError("offline"), wire.AnyListTimeoutError("timeout")]
+)
+async def test_collection_service_errors_are_translated(hass, failure):
+    """Translate membership-update failures while preserving their causes."""
+    client, _ = await _setup(hass)
+    client.get_user_data.side_effect = failure
+    with pytest.raises(HomeAssistantError) as error:
+        await _call(
+            hass,
+            "add_recipe_to_collection",
+            {"recipe_id": "martini", "collection_id": "cocktails"},
+        )
+    assert error.value.translation_key == "collection_update_failed"
     assert error.value.__cause__ is failure
     client.post.assert_not_called()
 
