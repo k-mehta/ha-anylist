@@ -198,6 +198,19 @@ class Ingredient:
 
 
 @dataclass(slots=True)
+class RecipeIngredientSection:
+    """A section heading in a recipe's ingredient list (e.g. "For the sauce")."""
+
+    name: str
+    identifier: str | None = None
+
+
+# One ordered entry in a recipe's ingredient list: a section heading or a
+# plain ingredient. This mirrors anylist_rs `RecipeIngredientEntry`.
+RecipeIngredientEntry = RecipeIngredientSection | Ingredient
+
+
+@dataclass(slots=True)
 class RecipeCollection:
     """An AnyList recipe collection, including empty collections."""
 
@@ -241,6 +254,11 @@ class Recipe:
     id: str
     name: str
     ingredients: list[Ingredient] = field(default_factory=list)
+    # Ordered ingredient-list entries: section headings interleaved with the
+    # plain ingredients, exactly as AnyList stores them. `ingredients` above
+    # intentionally holds plain ingredients only, so search matching and
+    # add-to-shopping-list never see a heading.
+    ingredient_entries: list[RecipeIngredientEntry] = field(default_factory=list)
     preparation_steps: list[str] = field(default_factory=list)
     note: str | None = None
     source_name: str | None = None
@@ -779,19 +797,43 @@ def _parse_favourites_lists_response(data: bytes) -> list[FavouritesList]:
     return lists
 
 
-def _parse_ingredient(data: bytes) -> Ingredient | None:
-    """Parse a PBIngredient."""
+def _parse_ingredient_entry(data: bytes) -> RecipeIngredientEntry | None:
+    """Parse one PBIngredient: a section heading or a plain ingredient.
+
+    AnyList encodes a heading as a PBIngredient with the heading text in
+    field 2 (name), a stable identifier in field 6, and field 7
+    (is_heading) set to true. A plain ingredient carries field 2 (name)
+    plus optional field 1 (raw_ingredient), 3 (quantity), and 4 (note),
+    with field 7 absent or false. This matches anylist_rs `PbIngredient`
+    (prost tags 1 raw_ingredient, 2 name, 3 quantity, 4 note,
+    6 identifier, 7 is_heading) and its `recipes_from_response`, which
+    keeps headings in the ordered entry list only. Entries without a name
+    are dropped, as before.
+    """
     fields = _parse_fields(data)
     name = _first_string(fields, 2)
     if not name:
         return None
-
+    if _first_bool(fields, 7, default=False):
+        # The server normally sends a stable identifier; generate one when
+        # it does not, so a heading keeps its identity for the lifetime of
+        # the parsed recipe (same fallback as anylist_rs).
+        return RecipeIngredientSection(
+            name=name,
+            identifier=_first_string(fields, 6) or _generate_id(),
+        )
     return Ingredient(
         name=name,
         quantity=_first_string(fields, 3),
         note=_first_string(fields, 4),
         raw_ingredient=_first_string(fields, 1),
     )
+
+
+def _parse_ingredient(data: bytes) -> Ingredient | None:
+    """Parse a PBIngredient, ignoring section headings."""
+    entry = _parse_ingredient_entry(data)
+    return entry if isinstance(entry, Ingredient) else None
 
 
 def _parse_recipe(data: bytes) -> Recipe | None:
@@ -803,18 +845,19 @@ def _parse_recipe(data: bytes) -> Recipe | None:
     if not recipe_id or not name:
         return None
 
-    ingredients = [
-        ingredient
-        for raw_ingredient in _all_values(fields, 8)
-        if isinstance(raw_ingredient, bytes)
-        for ingredient in [_parse_ingredient(raw_ingredient)]
-        if ingredient is not None
+    entries = [
+        entry
+        for raw_entry in _all_values(fields, 8)
+        if isinstance(raw_entry, bytes)
+        for entry in [_parse_ingredient_entry(raw_entry)]
+        if entry is not None
     ]
 
     return Recipe(
         id=recipe_id,
         name=name,
-        ingredients=ingredients,
+        ingredients=[entry for entry in entries if isinstance(entry, Ingredient)],
+        ingredient_entries=entries,
         preparation_steps=[
             value.decode("utf-8", errors="replace")
             for value in _all_values(fields, 9)
@@ -1303,6 +1346,20 @@ class AnyListClient:
     def user_id(self) -> str:
         """Return the authenticated user ID."""
         return self._user_id
+
+    @property
+    def access_token(self) -> str:
+        """Return the current access token (for the push feed)."""
+        return self._access_token
+
+    @property
+    def client_identifier(self) -> str:
+        """Return the client identifier (for the push feed)."""
+        return self._client_identifier
+
+    def refresh_tokens(self) -> None:
+        """Refresh the access and refresh tokens (public, for the push feed)."""
+        self._refresh_tokens()
 
     def is_premium_user(self) -> bool:
         """Return whether the account is premium."""
@@ -1892,6 +1949,7 @@ class AnyListClient:
             id=recipe_id,
             name=name,
             ingredients=ingredients,
+            ingredient_entries=list(ingredients),
             preparation_steps=preparation_steps,
             photo_urls=[f"{_PHOTO_BASE_URL}{photo_id}.jpg"] if photo_id else [],
         )
@@ -2034,6 +2092,8 @@ class AnyListClient:
             for shopping_list in self.get_lists()
         )
         # Like the apps, add in reverse at the top to keep the recipe's order.
+        # Section headings never reach a shopping list: they live in
+        # `ingredient_entries`, not in `ingredients`.
         ingredients = reversed(recipe.ingredients) if at_top else recipe.ingredients
         for ingredient in ingredients:
             quantity = ingredient.quantity
@@ -2087,6 +2147,8 @@ class AnyListClient:
     def post(self, endpoint: str, body: bytes) -> bytes:
         """Post an AnyList operations request."""
         return self.post_multipart(f"/{endpoint}", "operations", body)
+
+
 
     def post_multipart(
         self,
@@ -2225,3 +2287,52 @@ class AnyListClient:
             raise AnyListHTTPError(status, f"AnyList request failed with HTTP {status}")
 
         return response_body
+
+
+@dataclass(slots=True)
+class UserDataSnapshot:
+    """One AnyList snapshot, parsed: lists, favourites, recipes, collections.
+
+    This is exactly what the per-section getters (``get_lists``,
+    ``get_favourites``, ``get_recipes``, ``get_collections``) return,
+    parsed from a single ``get_user_data()`` download instead of one
+    download each. The coordinator fetches the bytes once per poll and
+    shares the parsed snapshot between the list entities and the
+    recipe-cache sync.
+    """
+
+    lists: list[ShoppingList] = field(default_factory=list)
+    favourites: list[FavouriteItem] = field(default_factory=list)
+    recipes: list[Recipe] = field(default_factory=list)
+    collections: list[RecipeCollection] = field(default_factory=list)
+
+
+def parse_user_data(data: bytes) -> UserDataSnapshot:
+    """Parse raw ``get_user_data()`` bytes without another download.
+
+    An empty or unparseable snapshot parses to empty sections, matching
+    what the per-section getters return for the same bytes.
+    """
+    fields = _parse_fields(data)
+    raw_recipes = _first_value(fields, 3)
+    if isinstance(raw_recipes, bytes):
+        recipe_fields = _parse_fields(raw_recipes)
+        recipes = _parse_recipes_response(raw_recipes)
+        collections = _parse_recipe_collections(recipe_fields)
+    else:
+        recipes = []
+        collections = []
+    raw_favourites = _first_value(fields, 7)
+    favourites_lists = (
+        _parse_favourites_lists_response(raw_favourites)
+        if isinstance(raw_favourites, bytes)
+        else []
+    )
+    return UserDataSnapshot(
+        lists=_parse_user_data_lists(data),
+        favourites=[
+            item for favourites_list in favourites_lists for item in favourites_list.items
+        ],
+        recipes=recipes,
+        collections=collections,
+    )

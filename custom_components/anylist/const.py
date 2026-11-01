@@ -6,7 +6,7 @@ CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 CONF_MEAL_PLAN_CALENDAR = "meal_plan_calendar"
 CONF_SELECTED_LISTS = "selected_lists"
-CONF_POLL_INTERVAL = "poll_interval"
+CONF_FALLBACK_POLL_INTERVAL = "fallback_poll_interval"
 
 # Data keys
 DATA_CLIENT = "client"
@@ -18,9 +18,19 @@ ANYLIST_REQUEST_TIMEOUT = 15  # seconds
 ANYLIST_LOGIN_TIMEOUT = 20  # seconds
 ANYLIST_REFRESH_TIMEOUT = 30  # seconds
 ANYLIST_PHOTO_TIMEOUT = 65  # upload, token refresh, and image processing
-ANYLIST_DEFAULT_POLL_INTERVAL = 60  # seconds, default when no option is configured
-ANYLIST_MIN_POLL_INTERVAL = 60  # seconds
-ANYLIST_MAX_POLL_INTERVAL = 3600  # seconds
+
+# Fallback safety-net poll (design §8 phase 2). The push feed is the
+# primary sync mechanism; the coordinator polls ONLY while the feed is
+# down. The interval is a user option, never a hard-coded cadence:
+# Kshitij rejected polling as the mechanism — no polling at night, no
+# fixed interval doing downloads forever. Default 60 minutes is
+# PROPOSED, not confirmed — do not treat it as final.
+# The old poll_interval option (60 s default) is intentionally NOT
+# carried over: its stored value is the rejected behaviour, so entries
+# that stored it fall back to the new default instead.
+ANYLIST_DEFAULT_FALLBACK_POLL_INTERVAL = 3600  # seconds (60 minutes, proposed)
+ANYLIST_MIN_FALLBACK_POLL_INTERVAL = 300  # seconds (5 minutes)
+ANYLIST_MAX_FALLBACK_POLL_INTERVAL = 3600  # seconds (60 minutes)
 
 # Services
 SERVICE_REFRESH = "refresh"

@@ -462,14 +462,13 @@ def test_normalize_matches_search_folding():
     assert store.compute_content_hash(changed) != store.compute_content_hash(first)
 
 
-def test_poll_interval_constant_is_proposed_not_final():
-    # 15 minutes was proposed, not confirmed: the constant must exist
-    # and be clearly separate from the coordinator's live default,
-    # which this feature does not change.
-    assert const.ANYLIST_SQLITE_SYNC_POLL_INTERVAL == 900
-    assert const.ANYLIST_DEFAULT_POLL_INTERVAL == 60
-    assert const.ANYLIST_MIN_POLL_INTERVAL == 60
-    assert const.ANYLIST_MAX_POLL_INTERVAL == 3600
+def test_fallback_poll_interval_constant_is_proposed_not_final():
+    # 60 minutes is the proposed fallback default, not confirmed: the
+    # constant must exist and be clearly separate from any live default.
+    # The push feed is primary; this interval only runs while it is down.
+    assert const.ANYLIST_DEFAULT_FALLBACK_POLL_INTERVAL == 3600
+    assert const.ANYLIST_MIN_FALLBACK_POLL_INTERVAL == 300
+    assert const.ANYLIST_MAX_FALLBACK_POLL_INTERVAL == 3600
 
 
 def test_store_layer_imports_no_homeassistant():

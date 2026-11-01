@@ -20,7 +20,7 @@ from homeassistant.helpers.selector import (
     SelectSelectorMode,
 )
 
-from . import get_poll_interval
+from . import get_fallback_poll_interval
 from .client import (
     AnyListAuthError,
     AnyListClient,
@@ -28,13 +28,13 @@ from .client import (
     async_call_with_timeout,
 )
 from .const import (
-    ANYLIST_DEFAULT_POLL_INTERVAL,
+    ANYLIST_DEFAULT_FALLBACK_POLL_INTERVAL,
     ANYLIST_LOGIN_TIMEOUT,
-    ANYLIST_MAX_POLL_INTERVAL,
-    ANYLIST_MIN_POLL_INTERVAL,
+    ANYLIST_MAX_FALLBACK_POLL_INTERVAL,
+    ANYLIST_MIN_FALLBACK_POLL_INTERVAL,
     ANYLIST_REQUEST_TIMEOUT,
+    CONF_FALLBACK_POLL_INTERVAL,
     CONF_MEAL_PLAN_CALENDAR,
-    CONF_POLL_INTERVAL,
     CONF_SELECTED_LISTS,
     DOMAIN,
 )
@@ -68,13 +68,13 @@ def _credentials_schema(
     )
 
 
-def _poll_interval_selector() -> vol.All:
-    """Return the selector used for the polling interval option."""
+def _fallback_poll_interval_selector() -> vol.All:
+    """Return the selector used for the fallback polling interval option."""
     return vol.All(
         NumberSelector(
             NumberSelectorConfig(
-                min=ANYLIST_MIN_POLL_INTERVAL,
-                max=ANYLIST_MAX_POLL_INTERVAL,
+                min=ANYLIST_MIN_FALLBACK_POLL_INTERVAL,
+                max=ANYLIST_MAX_FALLBACK_POLL_INTERVAL,
                 step=1,
                 mode=NumberSelectorMode.BOX,
                 unit_of_measurement="seconds",
@@ -302,9 +302,9 @@ class AnyListConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 {
                     vol.Optional(CONF_MEAL_PLAN_CALENDAR, default=False): bool,
                     vol.Optional(
-                        CONF_POLL_INTERVAL,
-                        default=ANYLIST_DEFAULT_POLL_INTERVAL,
-                    ): _poll_interval_selector(),
+                        CONF_FALLBACK_POLL_INTERVAL,
+                        default=ANYLIST_DEFAULT_FALLBACK_POLL_INTERVAL,
+                    ): _fallback_poll_interval_selector(),
                 }
             ),
         )
@@ -383,9 +383,9 @@ class AnyListOptionsFlowHandler(config_entries.OptionsFlow):
         )] = bool
 
         schema_dict[vol.Optional(
-            CONF_POLL_INTERVAL,
-            default=get_poll_interval(self.config_entry),
-        )] = _poll_interval_selector()
+            CONF_FALLBACK_POLL_INTERVAL,
+            default=get_fallback_poll_interval(self.config_entry),
+        )] = _fallback_poll_interval_selector()
 
         return self.async_show_form(
             step_id="init",

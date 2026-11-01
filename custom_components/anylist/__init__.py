@@ -38,16 +38,17 @@ from .client import (
     Ingredient,
     Recipe,
     RecipeCollection,
+    RecipeIngredientSection,
     ShoppingList,
     async_call_with_timeout,
     parse_user_data,
     select_recipe_collection,
 )
 from .const import (
-    ANYLIST_DEFAULT_POLL_INTERVAL,
+    ANYLIST_DEFAULT_FALLBACK_POLL_INTERVAL,
     ANYLIST_LOGIN_TIMEOUT,
-    ANYLIST_MAX_POLL_INTERVAL,
-    ANYLIST_MIN_POLL_INTERVAL,
+    ANYLIST_MAX_FALLBACK_POLL_INTERVAL,
+    ANYLIST_MIN_FALLBACK_POLL_INTERVAL,
     ANYLIST_PHOTO_TIMEOUT,
     ANYLIST_REFRESH_TIMEOUT,
     ANYLIST_REQUEST_TIMEOUT,
@@ -77,9 +78,9 @@ from .const import (
     ATTR_RECIPE_NAME,
     ATTR_SCALE_FACTOR,
     CONF_EMAIL,
+    CONF_FALLBACK_POLL_INTERVAL,
     CONF_MEAL_PLAN_CALENDAR,
     CONF_PASSWORD,
-    CONF_POLL_INTERVAL,
     CONF_SELECTED_LISTS,
     DOMAIN,
     SERVICE_ADD_ITEM,
@@ -105,8 +106,19 @@ from .recipe_search import (
     normalize_search_text,
     search_store,
 )
+from .realtime import (
+    AnyListPushListener,
+    pause_coordinator_polling,
+    resume_coordinator_polling,
+)
 from .store import RecipeStore
-from .sync import data_to_recipe, sync_snapshot
+from .sync import (
+    data_to_recipe,
+    refresh_deleted_recipe,
+    refresh_recipe,
+    sync_snapshot,
+    updated_recipe,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -124,6 +136,9 @@ class AnyListRuntimeData:
     # The recipe cache (SQLite, design §5). None in tests and before
     # setup opens it; always set for a loaded entry.
     store: RecipeStore | None = None
+    # The push feed (design §8 phase 2). None in tests and before setup
+    # starts it; always set for a loaded entry.
+    listener: AnyListPushListener | None = None
 
 
 INGREDIENT_INPUT_SCHEMA = vol.Schema(
@@ -268,23 +283,35 @@ def _entry_option(entry: ConfigEntry, key: str, default: Any = None) -> Any:
     return entry.options.get(key, entry.data.get(key, default))
 
 
-def get_poll_interval(entry: ConfigEntry) -> int:
-    """Return the configured polling interval in seconds, clamped to safe bounds."""
-    value = _entry_option(entry, CONF_POLL_INTERVAL, ANYLIST_DEFAULT_POLL_INTERVAL)
+def get_fallback_poll_interval(entry: ConfigEntry) -> int:
+    """Return the configured fallback polling interval in seconds.
+
+    The push feed is the primary sync mechanism; this interval is only
+    the safety net while the feed is down, so it is clamped to safe
+    bounds. An entry that stored the old ``poll_interval`` option falls
+    back to the new default: the old 60 s value is the rejected
+    behaviour and is intentionally not carried over.
+    """
+    value = _entry_option(
+        entry, CONF_FALLBACK_POLL_INTERVAL, ANYLIST_DEFAULT_FALLBACK_POLL_INTERVAL
+    )
     try:
         interval = int(value)
     except (TypeError, ValueError, OverflowError):
         _LOGGER.warning(
-            "Invalid AnyList poll interval %r, using %s seconds",
+            "Invalid AnyList fallback poll interval %r, using %s seconds",
             value,
-            ANYLIST_DEFAULT_POLL_INTERVAL,
+            ANYLIST_DEFAULT_FALLBACK_POLL_INTERVAL,
         )
-        return ANYLIST_DEFAULT_POLL_INTERVAL
+        return ANYLIST_DEFAULT_FALLBACK_POLL_INTERVAL
 
-    clamped = min(max(interval, ANYLIST_MIN_POLL_INTERVAL), ANYLIST_MAX_POLL_INTERVAL)
+    clamped = min(
+        max(interval, ANYLIST_MIN_FALLBACK_POLL_INTERVAL),
+        ANYLIST_MAX_FALLBACK_POLL_INTERVAL,
+    )
     if clamped != interval:
         _LOGGER.warning(
-            "AnyList poll interval %s seconds is out of range, using %s seconds",
+            "AnyList fallback poll interval %s seconds is out of range, using %s seconds",
             interval,
             clamped,
         )
@@ -344,6 +371,18 @@ def _serialize_ingredient(ingredient: Any) -> dict[str, Any]:
     }
 
 
+def _serialize_ingredient_entry(entry: Any) -> dict[str, Any]:
+    """Serialize one ordered ingredient-list entry.
+
+    Section headings serialize as `{"type": "section", "name": ...}`;
+    plain ingredients serialize as `{"type": "ingredient", ...}` with the
+    same four fields as the flat `ingredients` list.
+    """
+    if isinstance(entry, RecipeIngredientSection):
+        return {"type": "section", ATTR_NAME: entry.name}
+    return {"type": "ingredient", **_serialize_ingredient(entry)}
+
+
 def _serialize_recipe(
     recipe: Any,
     *,
@@ -352,10 +391,18 @@ def _serialize_recipe(
 ) -> dict[str, Any]:
     """Serialize an AnyList recipe for service responses."""
     ingredients = []
+    ingredient_entries = []
     if include_ingredients:
         ingredients = [
             _serialize_ingredient(ingredient)
             for ingredient in (getattr(recipe, ATTR_INGREDIENTS, []) or [])
+        ]
+        # `ingredient_entries` is the ordered, heading-aware view of the
+        # same list; recipes parsed before this field existed simply have
+        # none, and callers fall back to `ingredients`.
+        ingredient_entries = [
+            _serialize_ingredient_entry(entry)
+            for entry in (getattr(recipe, "ingredient_entries", []) or [])
         ]
 
     preparation_steps = []
@@ -366,6 +413,7 @@ def _serialize_recipe(
         "id": getattr(recipe, "id", None),
         ATTR_NAME: getattr(recipe, ATTR_NAME, None),
         ATTR_INGREDIENTS: ingredients,
+        "ingredient_entries": ingredient_entries,
         ATTR_PREPARATION_STEPS: preparation_steps,
         ATTR_NOTE: getattr(recipe, ATTR_NOTE, None),
         "source_name": getattr(recipe, "source_name", None),
@@ -513,8 +561,8 @@ async def _async_resolve_recipe_from_store(
     download: exactly one selector, a missing recipe raises
     ``recipe_not_found``, a store failure raises ``recipe_load_failed``.
     The write actions keep the client resolver: they resolve live data
-    at write time, and update's post-write re-resolve would read a
-    stale cache without the post-write refresh work (a follow-up).
+    at write time, and refresh the store after a successful write, so
+    a later store read sees the new state.
     """
     _validate_exactly_one(
         recipe_id,
@@ -814,6 +862,35 @@ async def _async_refresh_entry(hass: HomeAssistant, entry_id: str) -> dict[str, 
     return coordinator.data
 
 
+async def _async_refresh_store_after_write(
+    hass: HomeAssistant,
+    store: RecipeStore | None,
+    *,
+    recipe: Recipe | None = None,
+    recipe_id: str | None = None,
+) -> None:
+    """Best-effort cache refresh after a successful recipe write.
+
+    Upserts the given recipe, or deletes the given id — no downloads.
+    A refresh failure is logged, never raised: the write already
+    succeeded, and the next poll repairs the cache. A missing store
+    (tests, or an entry set up before the cache existed) is a no-op.
+    """
+    if store is None:
+        return
+    try:
+        if recipe is not None:
+            await hass.async_add_executor_job(refresh_recipe, store, recipe)
+        elif recipe_id is not None:
+            await hass.async_add_executor_job(
+                refresh_deleted_recipe, store, recipe_id
+            )
+    except Exception as err:
+        _LOGGER.warning(
+            "AnyList recipe cache refresh after write failed: %s", err
+        )
+
+
 def _async_register_services(hass: HomeAssistant) -> None:
     """Register AnyList services."""
     if hass.services.has_service(DOMAIN, SERVICE_GET_RECIPES):
@@ -1055,6 +1132,10 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 error=err,
             ) from err
 
+        await _async_refresh_store_after_write(
+            hass, entry_data.store, recipe=recipe
+        )
+
         if not call.return_response:
             return None
 
@@ -1114,10 +1195,22 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 error=err,
             ) from err
 
+        await _async_refresh_store_after_write(
+            hass,
+            entry_data.store,
+            recipe=updated_recipe(
+                recipe,
+                name=call.data[ATTR_NAME],
+                ingredients=ingredients,
+                preparation_steps=preparation_steps,
+                photo_id=photo_id,
+            ),
+        )
+
         if not call.return_response:
             return None
 
-        updated_recipe = await _async_resolve_recipe(
+        resolved_recipe = await _async_resolve_recipe(
             hass,
             client,
             recipe_id=recipe.id,
@@ -1126,7 +1219,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
         )
         return {
             "recipe": _serialize_recipe(
-                updated_recipe,
+                resolved_recipe,
                 include_ingredients=True,
                 include_steps=True,
             )
@@ -1165,6 +1258,10 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 recipe=getattr(recipe, ATTR_NAME, recipe.id),
                 error=err,
             ) from err
+
+        await _async_refresh_store_after_write(
+            hass, entry_data.store, recipe_id=recipe.id
+        )
 
         if not call.return_response:
             return None
@@ -1407,24 +1504,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Fetch data from AnyList."""
         return await _async_fetch_data(hass, client, store)
 
-    poll_interval = get_poll_interval(entry)
+    # The coordinator's interval is only the fallback safety net: the
+    # push feed below pauses polling entirely while it is connected
+    # (design §8 phase 2). It starts as the fallback so the entry still
+    # syncs if the feed cannot connect.
+    fallback_interval = get_fallback_poll_interval(entry)
     coordinator = DataUpdateCoordinator(
         hass,
         _LOGGER,
         name=DOMAIN,
         update_method=async_update_data,
-        update_interval=timedelta(seconds=poll_interval),
+        update_interval=timedelta(seconds=fallback_interval),
         always_update=True,
     )
 
     await coordinator.async_config_entry_first_refresh()
 
-    entry.runtime_data = AnyListRuntimeData(
+    runtime_data = AnyListRuntimeData(
         client=client,
         coordinator=coordinator,
         icalendar_url=icalendar_url,
         store=store,
     )
+    entry.runtime_data = runtime_data
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     # Shopping list devices are reached through the account device.
@@ -1435,10 +1537,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     platforms = get_platforms(entry)
     await hass.config_entries.async_forward_entry_setups(entry, platforms)
+
+    # Start the push feed last, after the first refresh has populated the
+    # store. While it is connected, polling stops entirely; while it is
+    # down, the fallback interval above is the safety net. The feed is
+    # best-effort: if it cannot connect, setup still succeeds and the
+    # entry keeps syncing on the fallback poll.
+    async def _on_feed_connected() -> None:
+        pause_coordinator_polling(coordinator)
+
+    async def _on_feed_disconnected() -> None:
+        resume_coordinator_polling(coordinator, fallback_interval)
+        await coordinator.async_request_refresh()
+
+    listener = AnyListPushListener(
+        hass,
+        client,
+        on_sync=coordinator.async_request_refresh,
+        on_connected=_on_feed_connected,
+        on_disconnected=_on_feed_disconnected,
+    )
+    runtime_data.listener = listener
+    listener.start()
     _LOGGER.debug(
-        "AnyList polling enabled for config entry %s every %s seconds",
+        "AnyList push feed started for config entry %s; fallback poll every %s seconds while it is down",
         entry.entry_id,
-        poll_interval,
+        fallback_interval,
     )
 
     return True
@@ -1498,8 +1622,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     platforms = get_platforms(entry)
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, platforms):
         runtime_data = getattr(entry, "runtime_data", None)
-        if runtime_data is not None and runtime_data.store is not None:
-            runtime_data.store.close()
+        if runtime_data is not None:
+            # Stop the push feed first so no more refreshes are triggered
+            # while the entry is coming down.
+            if runtime_data.listener is not None:
+                await runtime_data.listener.stop()
+            if runtime_data.store is not None:
+                runtime_data.store.close()
         entry.runtime_data = None
 
     return unload_ok
