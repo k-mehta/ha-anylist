@@ -116,6 +116,7 @@ from .sync import (
     data_to_recipe,
     refresh_deleted_recipe,
     refresh_recipe,
+    refresh_recipe_membership,
     sync_snapshot,
     updated_recipe,
 )
@@ -868,13 +869,17 @@ async def _async_refresh_store_after_write(
     *,
     recipe: Recipe | None = None,
     recipe_id: str | None = None,
+    membership_recipe_id: str | None = None,
+    membership_collection: RecipeCollection | None = None,
+    membership_add: bool = False,
 ) -> None:
     """Best-effort cache refresh after a successful recipe write.
 
-    Upserts the given recipe, or deletes the given id — no downloads.
-    A refresh failure is logged, never raised: the write already
-    succeeded, and the next poll repairs the cache. A missing store
-    (tests, or an entry set up before the cache existed) is a no-op.
+    Upserts the given recipe, deletes the given id, or updates one
+    recipe's collection memberships — no downloads. A refresh failure
+    is logged, never raised: the write already succeeded, and the
+    next poll repairs the cache. A missing store (tests, or an entry
+    set up before the cache existed) is a no-op.
     """
     if store is None:
         return
@@ -884,6 +889,17 @@ async def _async_refresh_store_after_write(
         elif recipe_id is not None:
             await hass.async_add_executor_job(
                 refresh_deleted_recipe, store, recipe_id
+            )
+        elif (
+            membership_recipe_id is not None
+            and membership_collection is not None
+        ):
+            await hass.async_add_executor_job(
+                refresh_recipe_membership,
+                store,
+                membership_recipe_id,
+                membership_collection,
+                membership_add,
             )
     except Exception as err:
         _LOGGER.warning(
@@ -1033,6 +1049,13 @@ def _async_register_services(hass: HomeAssistant) -> None:
             raise _translated_error(err.reason) from err
         except Exception as err:
             raise _translated_error("collection_update_failed", error=err) from err
+        await _async_refresh_store_after_write(
+            hass,
+            entry_data.store,
+            membership_recipe_id=call.data[ATTR_RECIPE_ID],
+            membership_collection=collection,
+            membership_add=call.service == SERVICE_ADD_RECIPE_TO_COLLECTION,
+        )
         if not call.return_response:
             return None
         return {"collection": _serialize_collection(collection)}
