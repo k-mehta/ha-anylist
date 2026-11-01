@@ -29,6 +29,9 @@ from .client import (
     Ingredient,
     Recipe,
     RecipeCollection,
+    RecipeIngredientEntry,
+    RecipeIngredientSection,
+    _PHOTO_BASE_URL,
     parse_user_data,
 )
 from .store import (
@@ -64,12 +67,10 @@ class SyncResult:
 def _is_section(entry: object) -> bool:
     """Return whether an ingredient entry is a section heading.
 
-    Headings are the client's ``RecipeIngredientSection`` class. The
-    name is checked instead of importing the class: the headings
-    support is a separate feature, so this module must import and run
-    with and without it. No other entry type carries that name.
+    Headings are the client's ``RecipeIngredientSection`` class. No
+    other entry type carries that class.
     """
-    return type(entry).__name__ == "RecipeIngredientSection"
+    return isinstance(entry, RecipeIngredientSection)
 
 
 def recipe_to_data(recipe: Recipe) -> RecipeData:
@@ -142,26 +143,37 @@ def data_to_recipe(
 ) -> Recipe:
     """Map a stored recipe back onto a client ``Recipe``.
 
-    The reverse of ``recipe_to_data``: flat ingredients only — the
-    client ``Recipe`` on this branch carries no headings, so section
-    rows are dropped here (the headings feature maps them into
-    ``ingredient_entries`` instead). Times are seconds, exactly as
-    AnyList stores them, and collections come back in the recipe's
-    stored order.
+    The reverse of ``recipe_to_data``: section rows come back as
+    ``RecipeIngredientSection`` entries interleaved in
+    ``ingredient_entries`` exactly as stored, while ``ingredients``
+    holds plain ingredients only — a heading never appears there.
+    Times are seconds, exactly as AnyList stores them, and collections
+    come back in the recipe's stored order.
+
+    Section identifiers are not stored (the store keeps a section's
+    name and position only); a rebuilt section carries
+    ``identifier=None``, and the client generates one when the recipe
+    is parsed again from AnyList.
     """
-    return Recipe(
-        id=data.id,
-        name=data.name,
-        ingredients=[
-            Ingredient(
+    entries: list[RecipeIngredientEntry] = []
+    ingredients: list[Ingredient] = []
+    for entry in data.ingredients:
+        if entry.kind == "section":
+            entries.append(RecipeIngredientSection(name=entry.name or ""))
+        else:
+            ingredient = Ingredient(
                 name=entry.name or "",
                 quantity=entry.quantity,
                 note=entry.note,
                 raw_ingredient=entry.raw_ingredient,
             )
-            for entry in data.ingredients
-            if entry.kind == "ingredient"
-        ],
+            entries.append(ingredient)
+            ingredients.append(ingredient)
+    return Recipe(
+        id=data.id,
+        name=data.name,
+        ingredients=ingredients,
+        ingredient_entries=entries,
         preparation_steps=list(data.steps),
         note=data.note,
         source_name=data.source_name,
@@ -186,6 +198,63 @@ def collection_to_data(collection: RecipeCollection) -> CollectionData:
         name=collection.name,
         recipe_ids=list(collection.recipe_ids),
     )
+
+
+def refresh_recipe(store: RecipeStore, recipe: Recipe) -> bool:
+    """Upsert one client recipe into the store (post-write refresh).
+
+    The recipe's collections are upserted first so the upsert never
+    trips the store's unknown-collection check. Returns True when the
+    store changed. Zero downloads: the caller passes the recipe it
+    already has — the created recipe, or the updated one built from
+    the service call — instead of re-reading the account.
+    """
+    for collection in getattr(recipe, "collections", None) or []:
+        store.upsert_collection(collection.id, collection.name)
+    return store.upsert_recipe(recipe_to_data(recipe))
+
+
+def refresh_deleted_recipe(store: RecipeStore, recipe_id: str) -> bool:
+    """Remove one recipe from the store (post-write refresh).
+
+    Returns True when a row was removed, False when the recipe was
+    not in the store.
+    """
+    return store.delete_recipe(recipe_id)
+
+
+def updated_recipe(
+    recipe: Recipe,
+    *,
+    name: str,
+    ingredients: list[Ingredient],
+    preparation_steps: list[str],
+    photo_id: str | None,
+) -> Recipe:
+    """Return the client recipe as it stands after an update call.
+
+    Mirrors ``client.update_recipe``: it replaces the name, the
+    ingredients, and the steps, and the photo only when a new one is
+    supplied; every other field (id, times, servings, rating, note,
+    source, collections) is preserved. The service call supplies flat
+    ingredients, so a recipe that had headings comes back flat —
+    exactly as the server stores it after the update.
+    """
+    kwargs: dict[str, Any] = {
+        "name": name,
+        "ingredients": list(ingredients),
+        "preparation_steps": list(preparation_steps),
+        "photo_urls": (
+            [f"{_PHOTO_BASE_URL}{photo_id}.jpg"]
+            if photo_id is not None
+            else list(recipe.photo_urls)
+        ),
+    }
+    if hasattr(recipe, "ingredient_entries"):
+        # The update replaces the ingredient list wholesale with the
+        # flat service-call ingredients; any stored headings are gone.
+        kwargs["ingredient_entries"] = []
+    return replace(recipe, **kwargs)
 
 
 def sync_recipes(

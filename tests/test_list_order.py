@@ -482,7 +482,7 @@ async def test_select_entities_reflect_and_change_list_settings(
     )
     # The list has no stored sort order yet, so "manual" is stored with it.
     assert ("set_new_item_position", ("list-1", "top", True)) in client.calls
-    assert ("get_lists", ()) in client.calls
+    assert ("get_user_data", ()) in client.calls
 
     shopping_list.sort_order_is_set = True
     client.calls.clear()
