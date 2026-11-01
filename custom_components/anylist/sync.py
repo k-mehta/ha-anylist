@@ -223,6 +223,39 @@ def refresh_deleted_recipe(store: RecipeStore, recipe_id: str) -> bool:
     return store.delete_recipe(recipe_id)
 
 
+def refresh_recipe_membership(
+    store: RecipeStore,
+    recipe_id: str,
+    collection: RecipeCollection,
+    add: bool,
+) -> bool:
+    """Update one stored recipe's memberships after a collection write.
+
+    Reads the stored recipe, adds or removes the collection id, and
+    upserts it. The collection row is upserted first so the upsert
+    never trips the store's unknown-collection check. Returns True
+    when the store changed, False when the recipe was not in the
+    store or its memberships already matched. Zero downloads: the
+    caller passes the confirmed collection from the write — the
+    server already confirmed the membership, so the store is updated
+    from that, not from a re-read.
+    """
+    data = store.get_recipe(recipe_id)
+    if data is None:
+        return False
+    collections = list(data.collections)
+    if add:
+        if collection.id in collections:
+            return False
+        collections.append(collection.id)
+    elif collection.id not in collections:
+        return False
+    else:
+        collections.remove(collection.id)
+    store.upsert_collection(collection.id, collection.name)
+    return store.upsert_recipe(replace(data, collections=collections))
+
+
 def updated_recipe(
     recipe: Recipe,
     *,
