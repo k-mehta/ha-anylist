@@ -403,7 +403,7 @@ async def test_update_service_with_optional_image(
     assert [name for name, args in mutations] == (
         ["upload_recipe_photo", "update_recipe"] if image_url else ["update_recipe"]
     )
-    assert mutations[-1][1][-1] == ("uploaded-photo" if image_url else None)
+    assert mutations[-1][1][4] == ("uploaded-photo" if image_url else None)
 
 
 @pytest.mark.parametrize(

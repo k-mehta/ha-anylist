@@ -73,6 +73,7 @@ from .const import (
     ATTR_PREPARATION_STEPS,
     ATTR_QUERY,
     ATTR_QUANTITY,
+    ATTR_RATING,
     ATTR_RAW_INGREDIENT,
     ATTR_RECIPE_ID,
     ATTR_RECIPE_NAME,
@@ -257,15 +258,19 @@ UPDATE_RECIPE_SERVICE_SCHEMA = vol.Schema(
         vol.Optional(ATTR_CONFIG_ENTRY_ID): cv.string,
         vol.Optional(ATTR_RECIPE_ID): cv.string,
         vol.Optional(ATTR_RECIPE_NAME): cv.string,
-        vol.Required(ATTR_NAME): cv.string,
+        vol.Optional(ATTR_NAME): cv.string,
         vol.Optional(ATTR_IMAGE_URL): cv.url,
-        vol.Required(ATTR_INGREDIENTS): vol.All(
+        vol.Optional(ATTR_INGREDIENTS): vol.All(
             cv.ensure_list,
             [INGREDIENT_INPUT_SCHEMA],
         ),
-        vol.Required(ATTR_PREPARATION_STEPS): vol.All(
+        vol.Optional(ATTR_PREPARATION_STEPS): vol.All(
             cv.ensure_list,
             [cv.string],
+        ),
+        vol.Optional(ATTR_NOTE): cv.string,
+        vol.Optional(ATTR_RATING): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=5)
         ),
     }
 )
@@ -1184,8 +1189,12 @@ def _async_register_services(hass: HomeAssistant) -> None:
             recipe_name=call.data.get(ATTR_RECIPE_NAME),
             name_label=ATTR_RECIPE_NAME,
         )
-        ingredients = _build_ingredients(call.data[ATTR_INGREDIENTS])
-        preparation_steps = call.data[ATTR_PREPARATION_STEPS]
+        ingredients = (
+            _build_ingredients(call.data[ATTR_INGREDIENTS])
+            if ATTR_INGREDIENTS in call.data
+            else None
+        )
+        preparation_steps = call.data.get(ATTR_PREPARATION_STEPS)
 
         _LOGGER.debug(
             "Updating AnyList recipe '%s'",
@@ -1205,10 +1214,12 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 hass,
                 client.update_recipe,
                 recipe.id,
-                call.data[ATTR_NAME],
+                call.data.get(ATTR_NAME),
                 ingredients,
                 preparation_steps,
                 photo_id,
+                call.data.get(ATTR_NOTE),
+                call.data.get(ATTR_RATING),
                 timeout=ANYLIST_REFRESH_TIMEOUT,
             )
         except Exception as err:
@@ -1223,10 +1234,12 @@ def _async_register_services(hass: HomeAssistant) -> None:
             entry_data.store,
             recipe=updated_recipe(
                 recipe,
-                name=call.data[ATTR_NAME],
+                name=call.data.get(ATTR_NAME),
                 ingredients=ingredients,
                 preparation_steps=preparation_steps,
                 photo_id=photo_id,
+                note=call.data.get(ATTR_NOTE),
+                rating=call.data.get(ATTR_RATING),
             ),
         )
 

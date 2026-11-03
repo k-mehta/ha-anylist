@@ -21,6 +21,7 @@ from custom_components.anylist.client import (
     Ingredient,
     Recipe,
     RecipeCollection,
+    RecipeIngredientSection,
 )
 from custom_components.anylist.store import open_store
 from custom_components.anylist.sync import (
@@ -213,6 +214,42 @@ def test_updated_recipe_replaces_photo_only_when_supplied():
         photo_id=None,
     )
     assert without_photo.photo_urls == ["https://photos.anylist.com/old-photo.jpg"]
+
+
+def test_updated_recipe_note_only_keeps_headings_and_content():
+    """A note-only or rating-only update keeps headings and content."""
+    original = _recipe(
+        "r08",
+        "Creamy Tomato Pasta",
+        ingredients=[Ingredient(name="rigatoni", quantity="500 g")],
+        steps=["Boil the rigatoni"],
+        note="Family favourite",
+        rating=5,
+    )
+    original.ingredient_entries = [
+        RecipeIngredientSection(name="Pasta"),
+        Ingredient(name="rigatoni", quantity="500 g"),
+    ]
+
+    changed = updated_recipe(original, note="More salt.")
+    assert changed.note == "More salt."
+    assert changed.name == "Creamy Tomato Pasta"
+    assert [entry.name for entry in changed.ingredients] == ["rigatoni"]
+    assert changed.preparation_steps == ["Boil the rigatoni"]
+    assert changed.rating == 5
+    assert [entry.name for entry in changed.ingredient_entries] == [
+        "Pasta",
+        "rigatoni",
+    ]
+    assert isinstance(changed.ingredient_entries[0], RecipeIngredientSection)
+
+    rated = updated_recipe(original, rating=4)
+    assert rated.rating == 4
+    assert rated.note == "Family favourite"
+    assert [entry.name for entry in rated.ingredient_entries] == [
+        "Pasta",
+        "rigatoni",
+    ]
 
 
 def test_refresh_after_update_visible_immediately():

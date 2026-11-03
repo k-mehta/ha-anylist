@@ -399,15 +399,13 @@ update_recipe:
         text:
     name:
       name: New name
-      description: Replacement recipe name.
-      required: true
+      description: Replacement recipe name. Omit to keep the existing name.
       example: "Same-Day Pizza Dough"
       selector:
         text:
     ingredients:
       name: Ingredients
-      description: Complete replacement ingredient list.
-      required: true
+      description: Complete replacement ingredient list. Omit to keep the existing ingredients.
       example:
         - name: Flour
           quantity: 500 g
@@ -415,12 +413,26 @@ update_recipe:
           quantity: 325 ml
     preparation_steps:
       name: Preparation steps
-      description: Complete replacement preparation steps.
-      required: true
+      description: Complete replacement preparation steps. Omit to keep the existing steps.
       example:
         - Mix all ingredients.
         - Knead until smooth.
         - Rest for 2 hours.
+    note:
+      name: Note
+      description: Replacement note for the recipe. Omit to keep the existing note. Pass an empty string to clear it.
+      example: "More salt next time."
+      selector:
+        text:
+    rating:
+      name: Rating
+      description: Star rating from 0 (unrated) to 5. Omit to keep the existing rating.
+      example: 5
+      selector:
+        number:
+          min: 0
+          max: 5
+          step: 1
 
 delete_recipe:
   name: Delete recipe

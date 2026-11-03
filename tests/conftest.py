@@ -430,20 +430,34 @@ class FakeAnyListClient:
     def update_recipe(
         self,
         recipe_id: str,
-        name: str,
-        ingredients: list[Any],
-        preparation_steps: list[str],
+        name: str | None = None,
+        ingredients: list[Any] | None = None,
+        preparation_steps: list[str] | None = None,
         photo_id: str | None = None,
+        note: str | None = None,
+        rating: int | None = None,
     ) -> None:
         """Record a fake recipe update."""
-        self.calls.append(("update_recipe", (recipe_id, name, ingredients, preparation_steps, photo_id)))
+        self.calls.append(
+            (
+                "update_recipe",
+                (recipe_id, name, ingredients, preparation_steps, photo_id, note, rating),
+            )
+        )
         recipe = self.get_recipe_by_id(recipe_id)
         if recipe is not None:
-            recipe.name = name
-            recipe.ingredients = ingredients
-            recipe.preparation_steps = preparation_steps
+            if name is not None:
+                recipe.name = name
+            if ingredients is not None:
+                recipe.ingredients = ingredients
+            if preparation_steps is not None:
+                recipe.preparation_steps = preparation_steps
             if photo_id is not None:
                 recipe.photo_urls = [f"https://photos.anylist.com/{photo_id}.jpg"]
+            if note is not None:
+                recipe.note = note
+            if rating is not None:
+                recipe.rating = rating
 
     def delete_recipe(self, recipe_id: str) -> None:
         """Record deleting a fake recipe."""

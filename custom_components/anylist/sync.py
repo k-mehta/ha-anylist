@@ -259,34 +259,41 @@ def refresh_recipe_membership(
 def updated_recipe(
     recipe: Recipe,
     *,
-    name: str,
-    ingredients: list[Ingredient],
-    preparation_steps: list[str],
-    photo_id: str | None,
+    name: str | None = None,
+    ingredients: list[Ingredient] | None = None,
+    preparation_steps: list[str] | None = None,
+    photo_id: str | None = None,
+    note: str | None = None,
+    rating: int | None = None,
 ) -> Recipe:
     """Return the client recipe as it stands after an update call.
 
-    Mirrors ``client.update_recipe``: it replaces the name, the
-    ingredients, and the steps, and the photo only when a new one is
-    supplied; every other field (id, times, servings, rating, note,
-    source, collections) is preserved. The service call supplies flat
-    ingredients, so a recipe that had headings comes back flat —
-    exactly as the server stores it after the update.
+    Mirrors ``client.update_recipe``: only the supplied fields change.
+    A new photo replaces the photo URLs; otherwise they are kept. The
+    note and rating change only when supplied. Every other field (id,
+    times, servings, source, collections) is preserved. The service call
+    supplies flat ingredients, so a recipe that had headings comes back
+    flat — exactly as the server stores it after the update — but only
+    when the ingredients were actually replaced; a note-only or
+    rating-only update keeps the stored headings.
     """
-    kwargs: dict[str, Any] = {
-        "name": name,
-        "ingredients": list(ingredients),
-        "preparation_steps": list(preparation_steps),
-        "photo_urls": (
-            [f"{_PHOTO_BASE_URL}{photo_id}.jpg"]
-            if photo_id is not None
-            else list(recipe.photo_urls)
-        ),
-    }
-    if hasattr(recipe, "ingredient_entries"):
-        # The update replaces the ingredient list wholesale with the
-        # flat service-call ingredients; any stored headings are gone.
-        kwargs["ingredient_entries"] = []
+    kwargs: dict[str, Any] = {}
+    if name is not None:
+        kwargs["name"] = name
+    if ingredients is not None:
+        kwargs["ingredients"] = list(ingredients)
+        if hasattr(recipe, "ingredient_entries"):
+            # The update replaces the ingredient list wholesale with the
+            # flat service-call ingredients; any stored headings are gone.
+            kwargs["ingredient_entries"] = []
+    if preparation_steps is not None:
+        kwargs["preparation_steps"] = list(preparation_steps)
+    if photo_id is not None:
+        kwargs["photo_urls"] = [f"{_PHOTO_BASE_URL}{photo_id}.jpg"]
+    if note is not None:
+        kwargs["note"] = note
+    if rating is not None:
+        kwargs["rating"] = rating
     return replace(recipe, **kwargs)
 
 

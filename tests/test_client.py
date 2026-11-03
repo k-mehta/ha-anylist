@@ -606,3 +606,295 @@ def test_authenticated_post_and_get_user_data(monkeypatch: pytest.MonkeyPatch) -
     assert calls[-1][1]["headers"]["Authorization"] == "Bearer access"
     assert client.post("data/user-data/get", b"") == b"user-data"
     assert client.get_user_data() == b"user-data"
+
+
+def _recipe_from_update_body(body: bytes) -> client_module.Recipe:
+    """Decode the recipe from a captured save-recipe operation body."""
+    operations = client_module._parse_fields(body)
+    operation_raw = client_module._first_value(operations, 1)
+    assert isinstance(operation_raw, bytes)
+    operation = client_module._parse_fields(operation_raw)
+    recipe_raw = client_module._first_value(operation, 3)
+    assert isinstance(recipe_raw, bytes)
+    recipe = client_module._parse_recipe(recipe_raw)
+    assert recipe is not None
+    return recipe
+
+
+def _update_recipe_client() -> tuple[client_module.AnyListClient, list[tuple[str, bytes]]]:
+    """Return a client capturing save-recipe posts, seeded with recipes."""
+    client = _client()
+    captured: list[tuple[str, bytes]] = []
+    client.post = lambda path, body: captured.append((path, body))
+    client.get_user_data = lambda: _recipes_user_data()
+    return client, captured
+
+
+def test_update_recipe_note_only_keeps_everything_else() -> None:
+    """A note-only update writes field 5 and leaves the rest untouched."""
+    client, captured = _update_recipe_client()
+
+    client.update_recipe("recipe-1", note="More salt next time.")
+
+    assert len(captured) == 1
+    assert captured[0][0] == "data/user-recipe-data/update"
+    recipe = _recipe_from_update_body(captured[0][1])
+    assert recipe.note == "More salt next time."
+    assert recipe.name == "Weeknight Pasta"
+    assert [ingredient.name for ingredient in recipe.ingredients] == ["Pasta"]
+    assert recipe.ingredients[0].quantity == "1 box"
+    assert recipe.preparation_steps == ["Boil water"]
+    assert recipe.rating == 5
+    assert recipe.cook_time == 10
+    assert recipe.prep_time == 5
+    assert recipe.servings == "4"
+    assert recipe.source_name == "source"
+    assert recipe.source_url == "https://example.com"
+
+
+def test_update_recipe_note_only_keeps_headings() -> None:
+    """A note-only update does not flatten headed recipes."""
+    client = _client()
+    captured: list[tuple[str, bytes]] = []
+    client.post = lambda path, body: captured.append((path, body))
+    client.get_user_data = lambda: _recipes_with_headings_user_data()
+
+    client.update_recipe("recipe-headings", note="Use San Marzano.")
+
+    assert len(captured) == 1
+    recipe = _recipe_from_update_body(captured[0][1])
+    assert recipe.note == "Use San Marzano."
+    entries = recipe.ingredient_entries
+    assert len(entries) == 4
+    assert isinstance(entries[0], client_module.RecipeIngredientSection)
+    assert entries[0].name == "For the sauce"
+    assert entries[1].name == "Tomatoes"
+    assert isinstance(entries[2], client_module.RecipeIngredientSection)
+    assert entries[2].name == "Topping"
+    assert entries[3].name == "Basil"
+
+
+def test_update_recipe_empty_note_clears_it() -> None:
+    """An empty-string note clears the note instead of being ignored."""
+    client, captured = _update_recipe_client()
+
+    client.update_recipe("recipe-1", note="")
+
+    assert len(captured) == 1
+    recipe = _recipe_from_update_body(captured[0][1])
+    assert recipe.note == ""
+    assert recipe.name == "Weeknight Pasta"
+
+
+def test_update_recipe_omitted_note_leaves_it_untouched() -> None:
+    """Omitting the note keeps the existing note."""
+    client, captured = _update_recipe_client()
+
+    client.update_recipe("recipe-1", name="Better Pasta")
+
+    assert len(captured) == 1
+    recipe = _recipe_from_update_body(captured[0][1])
+    assert recipe.note == "note"
+    assert recipe.name == "Better Pasta"
+
+
+def test_update_recipe_rating_only_keeps_everything_else() -> None:
+    """A rating-only update writes field 15 and leaves the rest untouched."""
+    client, captured = _update_recipe_client()
+
+    client.update_recipe("recipe-1", rating=4)
+
+    assert len(captured) == 1
+    recipe = _recipe_from_update_body(captured[0][1])
+    assert recipe.rating == 4
+    assert recipe.note == "note"
+    assert recipe.name == "Weeknight Pasta"
+    assert [ingredient.name for ingredient in recipe.ingredients] == ["Pasta"]
+    assert recipe.preparation_steps == ["Boil water"]
+
+
+def test_update_recipe_rating_zero_clears_it() -> None:
+    """Rating 0 clears the rating (unrated)."""
+    client, captured = _update_recipe_client()
+
+    client.update_recipe("recipe-1", rating=0)
+
+    assert len(captured) == 1
+    recipe = _recipe_from_update_body(captured[0][1])
+    assert recipe.rating == 0
+    assert recipe.note == "note"
+
+
+def test_update_recipe_omitted_rating_leaves_it_untouched() -> None:
+    """Omitting the rating keeps the existing rating."""
+    client, captured = _update_recipe_client()
+
+    client.update_recipe("recipe-1", note="Still good.")
+
+    assert len(captured) == 1
+    recipe = _recipe_from_update_body(captured[0][1])
+    assert recipe.rating == 5
+    assert recipe.note == "Still good."
+
+
+def test_update_recipe_full_update_writes_all_supplied_fields() -> None:
+    """A full update writes name, ingredients, steps, note, and rating."""
+    client, captured = _update_recipe_client()
+    ingredient = client_module.Ingredient(
+        name="Pasta",
+        quantity="2 box",
+        note="short pasta",
+        raw_ingredient="2 box pasta",
+    )
+
+    client.update_recipe(
+        "recipe-1",
+        "Better Pasta",
+        [ingredient],
+        ["Boil", "Drain"],
+        note="Double batch.",
+        rating=4,
+    )
+
+    assert len(captured) == 1
+    recipe = _recipe_from_update_body(captured[0][1])
+    assert recipe.name == "Better Pasta"
+    assert [ingredient.name for ingredient in recipe.ingredients] == ["Pasta"]
+    assert recipe.ingredients[0].quantity == "2 box"
+    assert recipe.preparation_steps == ["Boil", "Drain"]
+    assert recipe.note == "Double batch."
+    assert recipe.rating == 4
+    # Fields outside the update are preserved.
+    assert recipe.source_name == "source"
+    assert recipe.servings == "4"
+
+
+def _scalable_recipe() -> client_module.Recipe:
+    """Return a recipe with numeric and non-numeric quantities."""
+    return client_module.Recipe(
+        id="recipe-1",
+        name="Weeknight Pasta",
+        ingredients=[
+            client_module.Ingredient(name="Pasta", quantity="1 box"),
+            client_module.Ingredient(name="Salt", quantity="a pinch"),
+            client_module.Ingredient(name="Water", quantity=None),
+        ],
+        servings="4",
+    )
+
+
+def test_scale_recipe_doubles_quantities() -> None:
+    """Scaling to double servings doubles numeric quantities."""
+    recipe = _scalable_recipe()
+
+    scaled = client_module.AnyListClient.scale_recipe(recipe, target_servings=8)
+
+    assert scaled is not recipe
+    assert [ingredient.quantity for ingredient in scaled.ingredients] == [
+        "2 box",
+        "a pinch",
+        None,
+    ]
+    assert scaled.name == "Weeknight Pasta"
+    assert scaled.servings == "4"
+    # The original is not mutated.
+    assert [ingredient.quantity for ingredient in recipe.ingredients] == [
+        "1 box",
+        "a pinch",
+        None,
+    ]
+
+
+def test_scale_recipe_halves_quantities() -> None:
+    """Scaling to half servings halves numeric quantities."""
+    recipe = _scalable_recipe()
+
+    scaled = client_module.AnyListClient.scale_recipe(recipe, target_servings=2)
+
+    assert [ingredient.quantity for ingredient in scaled.ingredients] == [
+        "0.5 box",
+        "a pinch",
+        None,
+    ]
+
+
+def test_scale_recipe_by_factor() -> None:
+    """A direct scale factor scales quantities without servings."""
+    recipe = _scalable_recipe()
+
+    scaled = client_module.AnyListClient.scale_recipe(recipe, scale_factor=3)
+
+    assert [ingredient.quantity for ingredient in scaled.ingredients] == [
+        "3 box",
+        "a pinch",
+        None,
+    ]
+
+
+def test_scale_recipe_missing_servings_raises() -> None:
+    """Scaling by target servings needs the recipe to list servings."""
+    recipe = _scalable_recipe()
+    recipe.servings = None
+
+    with pytest.raises(ValueError, match="does not list servings"):
+        client_module.AnyListClient.scale_recipe(recipe, target_servings=8)
+
+
+def test_scale_recipe_non_numeric_servings_raises() -> None:
+    """A servings value that is not a number cannot be scaled from."""
+    recipe = _scalable_recipe()
+    recipe.servings = "a few"
+
+    with pytest.raises(ValueError, match="does not list servings"):
+        client_module.AnyListClient.scale_recipe(recipe, target_servings=8)
+
+
+def test_scale_recipe_rejects_non_positive_scale() -> None:
+    """A zero or negative scale factor is rejected."""
+    recipe = _scalable_recipe()
+
+    with pytest.raises(ValueError, match="must be positive"):
+        client_module.AnyListClient.scale_recipe(recipe, scale_factor=0)
+    with pytest.raises(ValueError, match="must be positive"):
+        client_module.AnyListClient.scale_recipe(recipe, scale_factor=-1)
+    with pytest.raises(ValueError, match="target_servings must be a positive number"):
+        client_module.AnyListClient.scale_recipe(recipe, target_servings=0)
+
+
+def test_scale_recipe_needs_exactly_one_input() -> None:
+    """Scale needs exactly one of target servings or a scale factor."""
+    recipe = _scalable_recipe()
+
+    with pytest.raises(ValueError, match="exactly one"):
+        client_module.AnyListClient.scale_recipe(recipe)
+    with pytest.raises(ValueError, match="exactly one"):
+        client_module.AnyListClient.scale_recipe(
+            recipe, target_servings=8, scale_factor=2
+        )
+
+
+def test_scale_recipe_keeps_headings_in_entries() -> None:
+    """Scaling a parsed recipe doubles quantities and keeps headings."""
+    client = _client()
+    client.get_user_data = lambda: _recipes_with_headings_user_data()
+    recipe = client.get_recipes()[0]
+    recipe.servings = "4"
+
+    scaled = client_module.AnyListClient.scale_recipe(recipe, target_servings=8)
+
+    assert [ingredient.quantity for ingredient in scaled.ingredients] == [
+        "1000 g",
+        None,
+    ]
+    assert [entry.name for entry in scaled.ingredient_entries] == [
+        "For the sauce",
+        "Tomatoes",
+        "Topping",
+        "Basil",
+    ]
+    assert isinstance(scaled.ingredient_entries[0], client_module.RecipeIngredientSection)
+    # The original is not mutated.
+    assert [ingredient.quantity for ingredient in recipe.ingredients] == [
+        "500 g",
+        None,
+    ]

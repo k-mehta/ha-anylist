@@ -36,8 +36,10 @@ from custom_components.anylist.const import (
     ATTR_INGREDIENTS,
     ATTR_LIST_NAME,
     ATTR_NAME,
+    ATTR_NOTE,
     ATTR_PREPARATION_STEPS,
     ATTR_QUERY,
+    ATTR_RATING,
     ATTR_RECIPE_NAME,
     ATTR_SCALE_FACTOR,
     CONF_MEAL_PLAN_CALENDAR,
@@ -650,6 +652,45 @@ async def test_service_actions_return_responses(hass: HomeAssistant) -> None:
         "recipe_name": "Better Soup",
     }
     assert coordinator.refresh_count == 1
+
+
+async def test_update_recipe_note_and_rating_only(hass: HomeAssistant) -> None:
+    """A note-only or rating-only update needs no name/ingredients/steps."""
+    entry = _mock_entry()
+    entry.add_to_hass(hass)
+    client, coordinator = _attach_runtime(hass, entry)
+    assert await async_setup(hass, {})
+
+    note_response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_UPDATE_RECIPE,
+        {
+            ATTR_RECIPE_NAME: "Weeknight Pasta",
+            ATTR_NOTE: "More salt next time.",
+        },
+        blocking=True,
+        return_response=True,
+    )
+    assert note_response["recipe"][ATTR_NOTE] == "More salt next time."
+    assert note_response["recipe"][ATTR_NAME] == "Weeknight Pasta"
+    assert note_response["recipe"][ATTR_PREPARATION_STEPS] == ["Boil water"]
+    # The client got None for the content fields it was not asked to change.
+    assert ("update_recipe", ("recipe-1", None, None, None, None, "More salt next time.", None)) in client.calls
+
+    rating_response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_UPDATE_RECIPE,
+        {
+            ATTR_RECIPE_NAME: "Weeknight Pasta",
+            ATTR_RATING: 4,
+        },
+        blocking=True,
+        return_response=True,
+    )
+    assert rating_response["recipe"]["rating"] == 4
+    assert rating_response["recipe"][ATTR_NOTE] == "More salt next time."
+    assert rating_response["recipe"][ATTR_NAME] == "Weeknight Pasta"
+    assert ("update_recipe", ("recipe-1", None, None, None, None, None, 4)) in client.calls
 
 
 async def test_service_action_errors_are_translated(hass: HomeAssistant) -> None:

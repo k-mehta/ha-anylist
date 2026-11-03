@@ -7,7 +7,7 @@ the wire format used by anylist_rs.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import logging
 import re
@@ -2022,23 +2022,54 @@ class AnyListClient:
     def update_recipe(
         self,
         recipe_id: str,
-        name: str,
-        ingredients: list[Ingredient],
-        preparation_steps: list[str],
+        name: str | None = None,
+        ingredients: list[Ingredient] | None = None,
+        preparation_steps: list[str] | None = None,
         photo_id: str | None = None,
+        note: str | None = None,
+        rating: int | None = None,
     ) -> None:
-        """Update recipe content, preserving photos unless a new one is supplied."""
+        """Update recipe content, preserving photos unless a new one is supplied.
+
+        Only the supplied fields change. Omit a field to keep its current
+        value — the original is preserved byte-for-byte, so a note-only or
+        rating-only update never drops ingredient headings or any other
+        field this client does not model. Pass an empty string for note to
+        clear it; pass rating 0 to clear the rating (unrated).
+        """
         fields = self._get_recipe_data_fields()
         raw_recipe = self._find_raw_recipe(fields, recipe_id)
         # The web app edits a copy of the original PBRecipe. Preserve fields
         # outside this action's scope, including photos and creation metadata.
-        replaced_fields = {2, 3, 8, 9}
+        # Only the fields actually supplied are replaced; everything else is
+        # carried over unchanged from the original message.
+        replaced_fields = {2}
+        if name is not None:
+            replaced_fields.add(3)
+        if ingredients is not None:
+            replaced_fields.add(8)
+        if preparation_steps is not None:
+            replaced_fields.add(9)
+        if note is not None:
+            replaced_fields.add(5)
+        if rating is not None:
+            replaced_fields.add(15)
         if photo_id is not None:
             replaced_fields.update({11, 13})
         payload = [_preserve_message_fields(raw_recipe, replaced_fields)]
-        payload.extend((_field_double(2, _current_timestamp()), _field_string(3, name)))
-        payload.extend(_field_message(8, _pb_ingredient(item)) for item in ingredients)
-        payload.extend(_field_string(9, step) for step in preparation_steps)
+        payload.append(_field_double(2, _current_timestamp()))
+        if name is not None:
+            payload.append(_field_string(3, name))
+        if ingredients is not None:
+            payload.extend(
+                _field_message(8, _pb_ingredient(item)) for item in ingredients
+            )
+        if preparation_steps is not None:
+            payload.extend(_field_string(9, step) for step in preparation_steps)
+        if note is not None:
+            payload.append(_field_string(5, note))
+        if rating is not None:
+            payload.append(_field_int32(15, rating))
         if photo_id is not None:
             payload.append(_field_string(11, photo_id))
         operation = _pb_recipe_operation(
@@ -2048,6 +2079,80 @@ class AnyListClient:
             recipe_data_id=self._recipe_data_id(fields),
         )
         self.post("data/user-recipe-data/update", _pb_recipe_operation_list([operation]))
+
+    @staticmethod
+    def scale_recipe(
+        recipe: Recipe,
+        target_servings: float | None = None,
+        scale_factor: float | None = None,
+    ) -> Recipe:
+        """Return a scaled copy of a recipe for cooking a different yield.
+
+        Transient only: this is pure computation — no API call, nothing is
+        persisted, and the stored recipe is untouched. Only ingredient
+        quantities are scaled; the note, steps, name, and every other
+        field are copied unchanged, including the servings field (the
+        caller tracks the target servings for display). The original
+        recipe object is not mutated.
+
+        Provide exactly one of target_servings or scale_factor. With
+        target_servings, the scale is target / recipe.servings, so the
+        recipe must list servings as a number. With scale_factor, that
+        factor is used directly. The scale must be positive. An ingredient
+        whose quantity has no leading number is left unchanged.
+        """
+        if (target_servings is None) == (scale_factor is None):
+            raise ValueError(
+                "scale_recipe needs exactly one of target_servings or scale_factor"
+            )
+        if scale_factor is not None:
+            scale = scale_factor
+        else:
+            if target_servings is None or target_servings <= 0:
+                raise ValueError("target_servings must be a positive number")
+            try:
+                current = (
+                    float(recipe.servings) if recipe.servings is not None else None
+                )
+            except ValueError:
+                current = None
+            if current is None or current <= 0:
+                raise ValueError(
+                    "cannot scale to a target servings: the recipe does not "
+                    "list servings as a number"
+                )
+            scale = target_servings / current
+        if scale <= 0:
+            raise ValueError("scale_factor must be positive")
+
+        new_ingredients: list[Ingredient] = []
+        new_entries: list[RecipeIngredientEntry] = []
+        # The ordered entries list is the source of truth (ingredients is
+        # the same objects filtered); fall back to ingredients when a
+        # recipe was built without entries.
+        source = recipe.ingredient_entries or recipe.ingredients
+        for entry in source:
+            if isinstance(entry, RecipeIngredientSection):
+                new_entries.append(entry)
+                continue
+            scaled = Ingredient(
+                name=entry.name,
+                quantity=_scale_quantity(entry.quantity, scale)
+                if entry.quantity is not None
+                else None,
+                note=entry.note,
+                raw_ingredient=entry.raw_ingredient,
+            )
+            new_entries.append(scaled)
+            new_ingredients.append(scaled)
+        return replace(
+            recipe,
+            ingredients=new_ingredients,
+            ingredient_entries=new_entries,
+            preparation_steps=list(recipe.preparation_steps),
+            photo_urls=list(recipe.photo_urls),
+            collections=list(recipe.collections),
+        )
 
     def delete_recipe(self, recipe_id: str) -> None:
         """Delete a recipe."""
