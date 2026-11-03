@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.11.1 - 2026-11-03
+
+- Make the recipe note and rating editable via `anylist.update_recipe`:
+  name, ingredients, and preparation steps are now optional, so a
+  note-only or rating-only update leaves everything else untouched,
+  including ingredient headings. An empty-string note clears the note;
+  rating 0 clears the rating.
+- Add `AnyListClient.scale_recipe` for transient recipe scaling (target
+  servings or a scale factor): returns a scaled copy of a recipe with
+  ingredient quantities multiplied, using the existing quantity scaler.
+  Pure computation — no API call, no persistence, original unmutated.
 
 ## 0.11.0 - 2026-10-25
 
